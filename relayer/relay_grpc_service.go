@@ -526,6 +526,9 @@ func (s *RelayGRPCService) forwardToBackend(
 	if backendParsed.Path != "" && backendParsed.Path != "/" {
 		requestURL.Path = backendParsed.Path + requestURL.Path
 	}
+	// Normalize multi-slash artifacts (e.g. "//") before dispatch — raw
+	// backends without a normalizing proxy return 404 for `POST //`. See #8.
+	requestURL.Path = normalizeBackendPath(requestURL.Path)
 
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, poktHTTPRequest.Method, requestURL.String(), bytes.NewReader(poktHTTPRequest.BodyBz))

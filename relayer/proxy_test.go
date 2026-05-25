@@ -158,6 +158,32 @@ func TestMergeBackendPath(t *testing.T) {
 	}
 }
 
+// TestNormalizeBackendPath covers issue #8: PATH-style clients may forward
+// `//` (double-slash) as the request path, and raw backends without a
+// normalizing reverse proxy return 404 for `POST //`. The normalize step
+// applied at the dispatch site collapses these artifacts.
+func TestNormalizeBackendPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty stays empty", "", ""},
+		{"single slash unchanged", "/", "/"},
+		{"double slash collapses", "//", "/"},
+		{"triple slash collapses", "///", "/"},
+		{"leading double slash", "//rpc", "/rpc"},
+		{"internal double slash", "/foo//bar", "/foo/bar"},
+		{"trailing slash dropped", "/foo/", "/foo"},
+		{"plain path unchanged", "/v1/users", "/v1/users"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeBackendPath(tt.in))
+		})
+	}
+}
+
 func TestShouldCompressResponse(t *testing.T) {
 	tests := []struct {
 		name        string
