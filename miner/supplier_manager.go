@@ -2,7 +2,6 @@ package miner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alitto/pond/v2"
+	"github.com/puzpuzpuz/xsync/v4"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -33,11 +33,6 @@ type SupplierQueryClient interface {
 	InvalidateSupplier(operatorAddress string)
 }
 
-// ErrDrainAborted is returned by onSupplierReleased when the drain is vetoed
-// because the supplier is still staked on-chain. This tells the claimer to
-// keep the Redis claim key alive instead of releasing it.
-var ErrDrainAborted = errors.New("drain aborted: supplier still staked on-chain")
-
 // SupplierStatus represents the state of a supplier in the miner.
 type SupplierStatus int
 
@@ -50,12 +45,11 @@ const (
 
 // SupplierState holds the state for a single supplier in the miner.
 //
-// Status is stored atomically (int32) because consumeForSupplier reads
-// it from the relay hot path while removeSupplier writes it under
-// suppliersMu. Taking suppliersMu in the relay path would serialize
-// every relay through the map mutex; using an atomic gives lock-free
-// reads/writes with sequential consistency. Callers must use
-// LoadStatus / StoreStatus — do not access `status` directly.
+// Status is stored atomically (int32) so consumeForSupplier on the relay
+// hot path can read the draining flag without coordinating with the
+// teardown writer. The owning map is xsync.Map (lock-free); this atomic
+// is the per-state field equivalent. Callers must use LoadStatus /
+// StoreStatus — do not access `status` directly.
 type SupplierState struct {
 	OperatorAddr string
 	Services     []string
@@ -99,9 +93,8 @@ func (s *SupplierState) LoadStatus() SupplierStatus {
 //
 // Writers that also mutate other SupplierState fields (e.g.
 // addSupplierWithData initializing the struct, removeSupplier marking
-// a drain) should hold suppliersMu for the composite update but must
-// still use StoreStatus so concurrent LoadStatus readers observe a
-// well-defined transition.
+// a drain) must use StoreStatus so concurrent LoadStatus readers
+// observe a well-defined transition.
 func (s *SupplierState) StoreStatus(status SupplierStatus) {
 	s.status.Store(int32(status))
 }
@@ -244,9 +237,11 @@ type SupplierManager struct {
 	keyManager keys.KeyManager
 	registry   *SupplierRegistry
 
-	// Per-supplier state
-	suppliers   map[string]*SupplierState
-	suppliersMu sync.RWMutex
+	// Per-supplier state. xsync.Map provides lock-free reads and atomic
+	// LoadOrStore / LoadAndDelete, which means slow per-supplier teardown
+	// (Consumer.Close → wg.Wait) cannot block the relay/claimer hot paths
+	// — there is no global lock to acquire.
+	suppliers *xsync.Map[string, *SupplierState]
 
 	// Message processing callback
 	onRelay func(ctx context.Context, supplierAddr string, msg *transport.StreamMessage) error
@@ -301,7 +296,7 @@ func NewSupplierManager(
 		config:       config,
 		keyManager:   keyManager,
 		registry:     registry,
-		suppliers:    make(map[string]*SupplierState),
+		suppliers:    xsync.NewMap[string, *SupplierState](),
 		querySubpool: querySubpool,
 	}
 
@@ -694,10 +689,7 @@ func (m *SupplierManager) onSupplierClaimed(ctx context.Context, supplier string
 		Msg("claimed supplier, starting handoff validation")
 
 	// Check if we already have this supplier
-	m.suppliersMu.RLock()
-	_, exists := m.suppliers[supplier]
-	m.suppliersMu.RUnlock()
-	if exists {
+	if _, exists := m.suppliers.Load(supplier); exists {
 		m.logger.Debug().Str("supplier", supplier).Msg("supplier already initialized")
 		return nil
 	}
@@ -714,30 +706,35 @@ func (m *SupplierManager) onSupplierClaimed(ctx context.Context, supplier string
 }
 
 // onSupplierReleased is called when a supplier claim is released.
-// It verifies on-chain staking status before draining to prevent false drains.
+//
+// All callsites of SupplierClaimer.Release that invoke this callback
+// (rebalance, shutdown, claim-callback-failure) operate on suppliers that
+// are expected to remain staked on-chain — the release is an internal
+// handoff between miner instances, not a chain-level unstake. Issue #7:
+// vetoing drains here when the supplier is still staked permanently
+// pinned the supplier to the original miner and blocked every
+// fair-share rebalance. We still query the chain so the existing
+// drain-decision metric retains its observability value, but the result
+// no longer vetoes the drain.
+//
+// The drain itself runs in its own goroutine because Consumer.Close can
+// sit on a blocked XREAD for tens of seconds while the consumer
+// goroutine notices ctx cancellation; running drains synchronously here
+// would block the claimer's rebalance loop and stall the next Lua DEL,
+// preventing other miners from seeing the released claim key. This
+// mirrors the key_removal path.
 func (m *SupplierManager) onSupplierReleased(ctx context.Context, supplier string) error {
-	shouldDrain, verifyResult := m.verifySupplierUnstaked(ctx, supplier, "rebalance_release")
+	_, verifyResult := m.verifySupplierUnstaked(ctx, supplier, "rebalance_release")
 	supplierDrainDecisionTotal.WithLabelValues("rebalance_release", verifyResult).Inc()
 
 	m.logger.Info().
 		Str("supplier", supplier).
 		Str("drain_trigger", "rebalance_release").
 		Str("on_chain_result", verifyResult).
-		Bool("drain_aborted", !shouldDrain).
 		Str("instance_id", m.config.MinerID).
 		Msg("drain decision audit")
 
-	if !shouldDrain {
-		m.logger.Warn().
-			Str("supplier", supplier).
-			Str("on_chain_result", verifyResult).
-			Str("instance_id", m.config.MinerID).
-			Msg("DRAIN ABORTED: supplier is staked on-chain, keeping claim")
-		return ErrDrainAborted
-	}
-
-	// Remove the supplier (with drain)
-	m.removeSupplier(supplier)
+	go m.removeSupplier(supplier)
 	return nil
 }
 
@@ -974,12 +971,11 @@ func (m *SupplierManager) handleKeyChange(ctx context.Context, operatorAddr stri
 // addSupplierWithData adds a new supplier to the manager with optional pre-warmed data.
 // If prewarmedData is nil, it will query fresh data from the chain.
 func (m *SupplierManager) addSupplierWithData(ctx context.Context, operatorAddr string, prewarmedData *SupplierWarmupData) error {
-	m.suppliersMu.Lock()
-	defer m.suppliersMu.Unlock()
-
-	// Check if already exists
-	if _, exists := m.suppliers[operatorAddr]; exists {
-		return nil // Already added
+	// Fast-path duplicate check. The atomic LoadOrStore below is the
+	// authoritative guard against concurrent adds; this early Load just
+	// avoids building ~hundreds of objects when the answer is obvious.
+	if _, exists := m.suppliers.Load(operatorAddr); exists {
+		return nil
 	}
 
 	// Create supplier-specific context
@@ -1207,7 +1203,22 @@ func (m *SupplierManager) addSupplierWithData(ctx context.Context, operatorAddr 
 	}
 	state.StoreStatus(SupplierStatusActive)
 
-	m.suppliers[operatorAddr] = state
+	// Atomic insert. If another goroutine raced us and stored its own
+	// state, drop ours (and tear down the resources we just constructed)
+	// so we don't leak a consumer goroutine and Redis connection.
+	if _, loaded := m.suppliers.LoadOrStore(operatorAddr, state); loaded {
+		cancelFn()
+		if lifecycleManager != nil {
+			_ = lifecycleManager.Close()
+		}
+		if smstManager != nil {
+			_ = smstManager.Close()
+		}
+		_ = consumer.Close()
+		_ = sessionCoordinator.Close()
+		_ = sessionStore.Close()
+		return nil
+	}
 
 	// Start consuming in background
 	state.wg.Add(1)
@@ -1415,8 +1426,8 @@ func (m *SupplierManager) consumeForSupplier(ctx context.Context, state *Supplie
 			// When draining, we continue processing existing messages
 			// but log that we're in drain mode for visibility.
 			// LoadStatus is lock-free — removeSupplier publishes the
-			// draining flag via StoreStatus under suppliersMu, and
-			// this read stays off the map mutex on the hot path.
+			// draining flag via StoreStatus and this read stays off
+			// any shared mutex on the hot path.
 			if state.LoadStatus() == SupplierStatusDraining {
 				m.logger.Debug().
 					Str(logging.FieldSupplier, state.OperatorAddr).
@@ -1549,18 +1560,20 @@ func (m *SupplierManager) removeSupplier(operatorAddr string) {
 		ctx = context.Background()
 	}
 
-	m.suppliersMu.Lock()
-	state, exists := m.suppliers[operatorAddr]
+	// Atomic remove-and-take. We pull the state out of the map FIRST so the
+	// slow per-supplier teardown below (Consumer.Close → wg.Wait can sit on
+	// a blocked XREAD for tens of seconds) holds no map coordination at all.
+	// A subsequent claim of the same supplier on this miner will see an
+	// empty slot and construct a fresh state — the old state's resources
+	// are private to this goroutine and torn down independently.
+	state, exists := m.suppliers.LoadAndDelete(operatorAddr)
 	if !exists {
-		m.suppliersMu.Unlock()
 		return
 	}
 
-	// Mark as draining and copy services while holding lock
 	state.StoreStatus(SupplierStatusDraining)
 	servicesCopy := make([]string, len(state.Services))
 	copy(servicesCopy, state.Services)
-	m.suppliersMu.Unlock()
 
 	// Publish draining status to registry
 	if m.registry != nil {
@@ -1591,22 +1604,17 @@ func (m *SupplierManager) removeSupplier(operatorAddr string) {
 		Msg("supplier marked as draining, waiting for pending work...")
 
 	// Wait for pending work (TODO: implement proper tracking)
-	// For now, just wait for consumer to finish
+	// For now, just wait for consumer to finish.
+	// No global lock — the state was already atomically removed from the map.
 	state.cancelFn()
 	state.wg.Wait()
 
-	// Cleanup
-	m.suppliersMu.Lock()
-	defer m.suppliersMu.Unlock()
-
-	// Close lifecycle manager first to stop monitoring
 	if state.LifecycleManager != nil {
 		if err := state.LifecycleManager.Close(); err != nil {
 			m.logger.Warn().Err(err).Str(logging.FieldSupplier, operatorAddr).Msg("error closing lifecycle manager")
 		}
 	}
 
-	// Close SMST manager
 	if state.SMSTManager != nil {
 		if err := state.SMSTManager.Close(); err != nil {
 			m.logger.Warn().Err(err).Str(logging.FieldSupplier, operatorAddr).Msg("error closing SMST manager")
@@ -1622,8 +1630,6 @@ func (m *SupplierManager) removeSupplier(operatorAddr string) {
 	if err := state.SessionStore.Close(); err != nil {
 		m.logger.Warn().Err(err).Str(logging.FieldSupplier, operatorAddr).Msg("error closing session store")
 	}
-
-	delete(m.suppliers, operatorAddr)
 
 	// Only remove from registry and cache if no other miner has already claimed
 	// this supplier. During rebalance, miner1 may release a supplier that miner2
@@ -1665,22 +1671,16 @@ func (m *SupplierManager) removeSupplier(operatorAddr string) {
 
 // GetSupplierState returns the state for a specific supplier.
 func (m *SupplierManager) GetSupplierState(operatorAddr string) (*SupplierState, bool) {
-	m.suppliersMu.RLock()
-	defer m.suppliersMu.RUnlock()
-
-	state, ok := m.suppliers[operatorAddr]
-	return state, ok
+	return m.suppliers.Load(operatorAddr)
 }
 
 // ListSuppliers returns all active supplier addresses.
 func (m *SupplierManager) ListSuppliers() []string {
-	m.suppliersMu.RLock()
-	defer m.suppliersMu.RUnlock()
-
-	suppliers := make([]string, 0, len(m.suppliers))
-	for addr := range m.suppliers {
+	suppliers := make([]string, 0, m.suppliers.Size())
+	m.suppliers.Range(func(addr string, _ *SupplierState) bool {
 		suppliers = append(suppliers, addr)
-	}
+		return true
+	})
 	return suppliers
 }
 
@@ -1705,28 +1705,28 @@ func (m *SupplierManager) Close() error {
 		}
 	}
 
-	// Wait for all suppliers to finish
-	m.suppliersMu.Lock()
-	for _, state := range m.suppliers {
+	// Wait for all suppliers to finish. Range is safe under concurrent
+	// mutation in xsync.Map; we LoadAndDelete each entry so a parallel
+	// claimer release doesn't double-close the resources.
+	m.suppliers.Range(func(addr string, _ *SupplierState) bool {
+		state, ok := m.suppliers.LoadAndDelete(addr)
+		if !ok {
+			return true
+		}
 		state.cancelFn()
 		state.wg.Wait()
 
-		// Close lifecycle manager first
 		if state.LifecycleManager != nil {
 			_ = state.LifecycleManager.Close()
 		}
-
-		// Close SMST manager
 		if state.SMSTManager != nil {
 			_ = state.SMSTManager.Close()
 		}
-
 		_ = state.Consumer.Close()
 		_ = state.SessionCoordinator.Close()
 		_ = state.SessionStore.Close()
-	}
-	m.suppliers = make(map[string]*SupplierState)
-	m.suppliersMu.Unlock()
+		return true
+	})
 
 	// Stop query subpool gracefully (drains queued tasks)
 	if m.querySubpool != nil {
@@ -1782,12 +1782,11 @@ func (m *SupplierManager) runStreamTrimmer(ctx context.Context) {
 // trimAllSupplierStreams trims old entries from all claimed supplier streams.
 // Submits work to the pool for parallel execution and waits for completion.
 func (m *SupplierManager) trimAllSupplierStreams(ctx context.Context, maxAge time.Duration) {
-	m.suppliersMu.RLock()
-	suppliers := make([]*SupplierState, 0, len(m.suppliers))
-	for _, state := range m.suppliers {
+	suppliers := make([]*SupplierState, 0, m.suppliers.Size())
+	m.suppliers.Range(func(_ string, state *SupplierState) bool {
 		suppliers = append(suppliers, state)
-	}
-	m.suppliersMu.RUnlock()
+		return true
+	})
 
 	if len(suppliers) == 0 {
 		return

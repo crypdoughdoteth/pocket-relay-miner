@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -78,7 +79,7 @@ func newTestSupplierManager(t *testing.T, queryClient SupplierQueryClient) *Supp
 			SupplierQueryClient: queryClient,
 			MinerID:             "test-instance",
 		},
-		suppliers: make(map[string]*SupplierState),
+		suppliers: xsync.NewMap[string, *SupplierState](),
 		ctx:       ctx,
 		cancelFn:  cancel,
 	}
@@ -165,26 +166,27 @@ func TestVerifySupplierUnstaked_NoQueryClient(t *testing.T) {
 }
 
 // =============================================================================
-// DRAIN-05: onSupplierReleased aborts drain when supplier is staked
+// DRAIN-05: onSupplierReleased drains unconditionally (issue #7)
+//
+// All Release() callsites — rebalance, shutdown, claim-callback-failure —
+// operate on suppliers that are expected to remain staked on-chain. The old
+// veto behaviour pinned suppliers to the original miner forever and broke
+// every dual-miner rebalance. The release path now drains regardless of
+// staking status; the chain query is retained only as an audit signal.
 // =============================================================================
 
-func TestOnSupplierReleased_AbortsWhenStaked(t *testing.T) {
+func TestOnSupplierReleased_DrainsEvenWhenStaked(t *testing.T) {
 	client := newStakedQueryClient("pokt1staked")
 	mgr := newTestSupplierManager(t, client)
 
-	// Pre-populate supplier in the map
-	st := &SupplierState{OperatorAddr: "pokt1staked"}
-	st.StoreStatus(SupplierStatusActive)
-	mgr.suppliers["pokt1staked"] = st
+	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 
 	err := mgr.onSupplierReleased(context.Background(), "pokt1staked")
-	require.ErrorIs(t, err, ErrDrainAborted, "staked supplier release should return ErrDrainAborted")
+	require.NoError(t, err, "rebalance release must not be vetoed by on-chain staking status")
 
-	// Supplier should still exist (drain was aborted)
-	mgr.suppliersMu.RLock()
-	_, exists := mgr.suppliers["pokt1staked"]
-	mgr.suppliersMu.RUnlock()
-	assert.True(t, exists, "supplier should still exist after drain aborted (staked on-chain)")
+	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
+	assert.Equal(t, beforeStaked+1, afterStaked,
+		"audit metric should still record on-chain result even though drain proceeds")
 }
 
 func TestOnSupplierReleased_ProceedsWhenNotFound(t *testing.T) {
@@ -224,10 +226,10 @@ func TestOnKeyChange_RemovalDrainsIfStaked(t *testing.T) {
 	assert.False(t, shouldDrain, "verifySupplierUnstaked returns false for staked supplier")
 	assert.Equal(t, "staked", result)
 
-	// But the onKeyChange removal branch proceeds regardless (operator explicit action).
-	// Verify by checking the metric label would be "key_removal"/"staked" and that
-	// the code does NOT abort (unlike onSupplierReleased which DOES abort).
-	// The key difference: onKeyChange always calls removeSupplier; onSupplierReleased aborts.
+	// onKeyChange removal proceeds regardless (operator explicit action).
+	// As of issue #7, onSupplierReleased also drains unconditionally, so the
+	// behavioural difference between the two paths is now only observability
+	// labels (drain_trigger: rebalance_release vs key_removal).
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("key_removal", "staked"))
 	supplierDrainDecisionTotal.WithLabelValues("key_removal", result).Inc()
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("key_removal", "staked"))
@@ -243,18 +245,11 @@ func TestDrainMetric_RebalanceRelease(t *testing.T) {
 	client := newStakedQueryClient("pokt1staked")
 	mgr := newTestSupplierManager(t, client)
 
-	// Pre-populate supplier
-	st := &SupplierState{OperatorAddr: "pokt1staked"}
-	st.StoreStatus(SupplierStatusActive)
-	mgr.suppliers["pokt1staked"] = st
-
-	// Get the counter value before
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 
-	// Trigger drain decision (will be aborted because staked)
+	// Drain proceeds (issue #7) but the audit metric is still recorded.
 	_ = mgr.onSupplierReleased(context.Background(), "pokt1staked")
 
-	// Counter should have incremented
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 	assert.Equal(t, beforeStaked+1, afterStaked,
 		"drain decision metric should increment for rebalance_release/staked")

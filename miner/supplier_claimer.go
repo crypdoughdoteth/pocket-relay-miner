@@ -2,7 +2,6 @@ package miner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -55,6 +54,14 @@ const (
 	// RebalanceInterval is how often to check for rebalancing.
 	// When new miners join, suppliers are redistributed within this interval.
 	RebalanceInterval = 30 * time.Second
+
+	// recentlyReleasedCooldown is how long this instance must wait before
+	// re-claiming a supplier it just released. Must be greater than one
+	// RebalanceInterval so peer miners have time to observe the freed
+	// claim key and pick it up; otherwise this instance's own next tick
+	// would race them via claimOrphaned. 2× gives a full peer cycle of
+	// headroom plus jitter buffer.
+	recentlyReleasedCooldown = 2 * RebalanceInterval
 )
 
 // SupplierClaimerConfig contains configuration for the SupplierClaimer.
@@ -99,6 +106,13 @@ type SupplierClaimer struct {
 	// release ordering during rebalancing to minimize session handoff churn.
 	claimed   map[string]time.Time
 	claimedMu sync.RWMutex
+
+	// Suppliers we released recently (rebalance handoff to peers). Used by
+	// claimOrphaned to skip keys we just gave up, otherwise our own next
+	// tick would race the peer's rebalance and re-grab everything we
+	// released. Entries are lazily pruned after recentlyReleasedCooldown.
+	recentlyReleased   map[string]time.Time
+	recentlyReleasedMu sync.Mutex
 
 	// All configured suppliers (from KeyManager)
 	allSuppliers   []string
@@ -148,11 +162,12 @@ func NewSupplierClaimer(
 		Msg("supplier claimer timing configuration")
 
 	return &SupplierClaimer{
-		logger:      componentLogger,
-		redisClient: redisClient,
-		instanceID:  instanceID,
-		config:      cfg,
-		claimed:     make(map[string]time.Time),
+		logger:           componentLogger,
+		redisClient:      redisClient,
+		instanceID:       instanceID,
+		config:           cfg,
+		claimed:          make(map[string]time.Time),
+		recentlyReleased: make(map[string]time.Time),
 	}
 }
 
@@ -314,19 +329,16 @@ func (c *SupplierClaimer) TryClaim(ctx context.Context, supplier string) bool {
 }
 
 // Release releases a supplier claim.
-// The release callback is invoked BEFORE the Redis claim key is deleted.
-// If the callback returns an error (e.g., ErrDrainAborted), the claim key
-// is kept and the supplier stays claimed by this instance.
+// The release callback is invoked BEFORE the Redis claim key is deleted; if
+// it returns an error we propagate it (the claim key stays alive) but we no
+// longer treat the on-chain staked status as a veto — see issue #7.
 func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
-	// Invoke release callback FIRST — it may veto the release (e.g., supplier
-	// is still staked on-chain). If it returns an error, we abort and keep the
-	// Redis claim key alive to prevent orphan-reclaim thrashing.
 	if c.onReleaseFn != nil {
 		if err := c.onReleaseFn(ctx, supplier); err != nil {
 			c.logger.Info().
 				Err(err).
 				Str("supplier", supplier).
-				Msg("release vetoed by callback, keeping claim")
+				Msg("release callback failed, keeping claim")
 			return err
 		}
 	}
@@ -357,6 +369,12 @@ func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
 	delete(c.claimed, supplier)
 	c.claimedMu.Unlock()
 
+	// Record the release so our own claimOrphaned does not race the
+	// peer miner who's supposed to pick this supplier up.
+	c.recentlyReleasedMu.Lock()
+	c.recentlyReleased[supplier] = time.Now()
+	c.recentlyReleasedMu.Unlock()
+
 	c.logger.Info().
 		Str("supplier", supplier).
 		Msg("released supplier claim")
@@ -364,6 +382,24 @@ func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
 	supplierReleasedTotal.WithLabelValues(supplier, c.instanceID).Inc()
 
 	return nil
+}
+
+// inRecentReleaseCooldown reports whether this instance released the
+// supplier within the last recentlyReleasedCooldown window. Side effect:
+// prunes the entry if it has aged out, so the map stays bounded by the
+// active supplier count.
+func (c *SupplierClaimer) inRecentReleaseCooldown(supplier string) bool {
+	c.recentlyReleasedMu.Lock()
+	defer c.recentlyReleasedMu.Unlock()
+	releasedAt, ok := c.recentlyReleased[supplier]
+	if !ok {
+		return false
+	}
+	if time.Since(releasedAt) >= recentlyReleasedCooldown {
+		delete(c.recentlyReleased, supplier)
+		return false
+	}
+	return true
 }
 
 // IsClaimed returns true if the supplier is claimed by this instance.
@@ -658,26 +694,34 @@ func (c *SupplierClaimer) rebalance() {
 		Int("current", currentCount).
 		Msg("rebalance check")
 
+	releasedThisTick := false
 	if currentCount > fairShare {
 		// Release excess suppliers
 		excess := currentCount - fairShare
-		c.releaseExcess(excess)
+		releasedThisTick = c.releaseExcess(excess) > 0
 	} else if currentCount < fairShare {
 		// Try to claim more suppliers
 		needed := fairShare - currentCount
 		c.claimMore(needed)
 	}
 
-	// Always check for orphaned suppliers that no miner instance has claimed.
-	// This catches suppliers that fell through the cracks during initial claiming
-	// or whose claim keys expired without being renewed.
-	c.claimOrphaned()
+	// Check for orphaned suppliers that no miner instance has claimed —
+	// keys that expired without being renewed (crashed miner). Skip this
+	// step if we just released suppliers in this tick: those keys are
+	// freshly empty BY DESIGN so peer miners can claim them, and
+	// claimOrphaned would otherwise race the peers and re-grab everything
+	// we just gave up, defeating the rebalance. A genuinely orphaned key
+	// (from a dead miner) will still be caught on the next tick.
+	if !releasedThisTick {
+		c.claimOrphaned()
+	}
 }
 
 // releaseExcess releases excess suppliers to allow other miners to claim them.
 // Suppliers are released newest-first (most recently claimed = least established)
-// to minimize session handoff churn during rebalancing.
-func (c *SupplierClaimer) releaseExcess(count int) {
+// to minimize session handoff churn during rebalancing. Returns the count of
+// suppliers actually released so the caller can suppress same-tick reclaims.
+func (c *SupplierClaimer) releaseExcess(count int) int {
 	type claimEntry struct {
 		supplier  string
 		claimedAt time.Time
@@ -696,19 +740,12 @@ func (c *SupplierClaimer) releaseExcess(count int) {
 	})
 
 	released := 0
-	vetoed := 0
 	for _, entry := range entries {
 		if released >= count {
 			break
 		}
 
 		if err := c.Release(c.ctx, entry.supplier); err != nil {
-			if errors.Is(err, ErrDrainAborted) {
-				// Release was vetoed (supplier still staked) — not an error,
-				// just means this supplier can't be rebalanced right now.
-				vetoed++
-				continue
-			}
 			c.logger.Warn().Err(err).Str("supplier", entry.supplier).Msg("failed to release excess supplier")
 			continue
 		}
@@ -721,14 +758,7 @@ func (c *SupplierClaimer) releaseExcess(count int) {
 			Time("claimed_at", entry.claimedAt).
 			Msg("released supplier for rebalancing (newest-first)")
 	}
-
-	if vetoed > 0 {
-		c.logger.Info().
-			Int("vetoed", vetoed).
-			Int("released", released).
-			Int("target", count).
-			Msg("rebalance: some releases vetoed (suppliers still staked)")
-	}
+	return released
 }
 
 // claimMore attempts to claim unclaimed suppliers.
@@ -775,8 +805,18 @@ func (c *SupplierClaimer) claimOrphaned() {
 
 	orphaned := 0
 	claimed := 0
+	skippedCooldown := 0
 	for _, supplier := range suppliers {
 		if c.IsClaimed(supplier) {
+			continue
+		}
+
+		// Don't reclaim a supplier we just released — the peer miner
+		// the release was meant for needs time to observe the empty
+		// claim key. A genuine orphan from a crashed miner will fall
+		// outside this window and be picked up normally.
+		if c.inRecentReleaseCooldown(supplier) {
+			skippedCooldown++
 			continue
 		}
 
@@ -809,6 +849,14 @@ func (c *SupplierClaimer) claimOrphaned() {
 
 // UpdateSuppliers updates the list of configured suppliers.
 // Called when KeyManager detects a config change.
+//
+// Issue #7 follow-up: previously this spawned `go c.rebalance()` on every
+// call. Reconcile fires UpdateSuppliers every ~13s and rebalance itself can
+// block on a slow supplier teardown — under that combination each tick
+// stacks a new rebalance goroutine, all racing on the same suppliers and
+// fanning out concurrent Release calls that deadlock on the supplier
+// manager's coordination. The periodic rebalanceLoop ticker already covers
+// fair-share convergence; UpdateSuppliers just records the new list.
 func (c *SupplierClaimer) UpdateSuppliers(suppliers []string) {
 	c.allSuppliersMu.Lock()
 	c.allSuppliers = suppliers
@@ -817,7 +865,4 @@ func (c *SupplierClaimer) UpdateSuppliers(suppliers []string) {
 	c.logger.Info().
 		Int("suppliers", len(suppliers)).
 		Msg("updated supplier list")
-
-	// Trigger rebalance
-	go c.rebalance()
 }

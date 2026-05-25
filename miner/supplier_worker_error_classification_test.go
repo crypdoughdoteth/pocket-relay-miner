@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,7 +79,7 @@ func newHandlerTestFixture(t *testing.T, supplierAddr string) *handlerTestFixtur
 	// handleRelay reads: the suppliers map and the deduplicator.
 	mgr := &SupplierManager{
 		logger:       logger,
-		suppliers:    map[string]*SupplierState{},
+		suppliers:    xsync.NewMap[string, *SupplierState](),
 		deduplicator: dedup,
 	}
 	state := &SupplierState{
@@ -88,7 +89,7 @@ func newHandlerTestFixture(t *testing.T, supplierAddr string) *handlerTestFixtur
 		SMSTManager:        smstMgr,
 	}
 	state.StoreStatus(SupplierStatusActive)
-	mgr.suppliers[supplierAddr] = state
+	mgr.suppliers.Store(supplierAddr, state)
 
 	worker := &SupplierWorker{
 		logger: logging.ForComponent(logger, "supplier_worker_test"),
