@@ -50,12 +50,19 @@ about the 503 window.
    nothing.
 3. Interactive confirmation unless `--yes` (same pattern as `invalidateAll`).
 4. DEL in pipelined batches of 500.
-5. **After** deletion, publish `{}` (clear-all payload, already handled by
-   every subscribed cache's `handleInvalidation`) to the six invalidation
-   channels: `application`, `service`, `supplier`, `account`,
+5. **After** deletion, publish `{}` (clear-all payload) to the six
+   invalidation channels: `application`, `service`, `supplier`, `account`,
    `shared_params`, `proof_params` — clears L1 fleet-wide immediately.
    Publishing before deletion would let L1s repopulate from a half-deleted
    L2.
+
+   **Bug found and fixed during implementation**: the `{}` clear-all branch
+   in the four entity caches (`application`, `service`, `account`,
+   `supplier`) was dead code — `json.Unmarshal("{}", &event)` succeeds, so
+   the check living inside the unmarshal-error branch never ran, and the
+   clear-all silently did nothing. `handleInvalidation` now checks
+   `payload == "{}"` before unmarshalling. The params singleton caches
+   were already correct (they clear+reload L1 on any payload).
 6. Print summary: deleted keys per type + channels notified.
 
 `session_params` / `supplier_params` caches don't subscribe to
