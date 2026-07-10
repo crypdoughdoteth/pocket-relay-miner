@@ -438,19 +438,21 @@ func (c *serviceCache) handleInvalidation(ctx context.Context, payload string) e
 		Str("payload", payload).
 		Msg("received service invalidation event")
 
+	// Empty-object payload means invalidate ALL entries (bulk clear-all).
+	// Must be checked before unmarshal: "{}" parses successfully into the
+	// event struct, so a check inside the error branch is unreachable.
+	if payload == "{}" {
+		c.localCache.Clear()
+		cacheInvalidations.WithLabelValues(serviceCacheType, SourcePubSub).Inc()
+		return nil
+	}
+
 	// Parse payload to get service_id
 	var event struct {
 		ServiceID string `json:"service_id"`
 	}
 
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
-		// Empty payload means invalidate all
-		if payload == "{}" {
-			c.localCache.Clear()
-			cacheInvalidations.WithLabelValues(serviceCacheType, SourcePubSub).Inc()
-			return nil
-		}
-
 		c.logger.Warn().
 			Err(err).
 			Str("payload", payload).
