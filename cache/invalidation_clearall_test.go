@@ -271,3 +271,84 @@ func TestSupplierCache_HandleInvalidation_ClearAll(t *testing.T) {
 		assert.True(t, ok)
 	})
 }
+
+// TestHandleInvalidation_ClearAllNegativeControls locks the clear-all trigger
+// to the EXACT literal "{}". Valid JSON that merely lacks (or empties) the
+// targeted field — a typo'd field name, an empty value, or a whitespace
+// variant of the empty object — must NOT wipe L1: a refactor that widened the
+// clear-all condition to "no field matched" would turn every malformed-but-
+// valid event into a fleet-wide L1 wipe.
+func TestHandleInvalidation_ClearAllNegativeControls(t *testing.T) {
+	ctx := context.Background()
+
+	payloads := []struct {
+		name    string
+		payload string
+	}{
+		{"empty field value", `{"address":"","service_id":"","operator_address":""}`},
+		{"unknown field", `{"unknown_field":"x"}`},
+		{"whitespace empty object", "{ }"},
+	}
+
+	assertSurvives := func(t *testing.T, name string, size int) {
+		t.Helper()
+		assert.Equalf(t, 2, size, "%s must NOT clear L1 (only the literal {} may)", name)
+	}
+
+	for _, tc := range payloads {
+		t.Run("application/"+tc.name, func(t *testing.T) {
+			client := newTestRedis(t)
+			ac := NewApplicationCache(testLogger(), client,
+				&frozenApplicationQueryClient{chainDelegatees: []string{"gw-a"}}).(*applicationCache)
+			_, err := ac.Get(ctx, "pokt1appA")
+			require.NoError(t, err)
+			_, err = ac.Get(ctx, "pokt1appB")
+			require.NoError(t, err)
+
+			require.NoError(t, ac.handleInvalidation(ctx, tc.payload))
+			assertSurvives(t, tc.payload, ac.localCache.Size())
+		})
+
+		t.Run("service/"+tc.name, func(t *testing.T) {
+			client := newTestRedis(t)
+			sc := NewServiceCache(testLogger(), client,
+				&frozenServiceQueryClient{chainCUPR: 1000}).(*serviceCache)
+			_, err := sc.Get(ctx, "svcA")
+			require.NoError(t, err)
+			_, err = sc.Get(ctx, "svcB")
+			require.NoError(t, err)
+
+			require.NoError(t, sc.handleInvalidation(ctx, tc.payload))
+			assertSurvives(t, tc.payload, sc.localCache.Size())
+		})
+
+		t.Run("account/"+tc.name, func(t *testing.T) {
+			client := newTestRedis(t)
+			ac := NewAccountCache(testLogger(), client,
+				&frozenAccountQueryClient{pubKey: pubKeyFromByte(0x11)}).(*accountCache)
+			_, err := ac.Get(ctx, "pokt1acctA")
+			require.NoError(t, err)
+			_, err = ac.Get(ctx, "pokt1acctB")
+			require.NoError(t, err)
+
+			require.NoError(t, ac.handleInvalidation(ctx, tc.payload))
+			assertSurvives(t, tc.payload, ac.localCache.Size())
+		})
+
+		t.Run("supplier/"+tc.name, func(t *testing.T) {
+			client := newTestRedis(t)
+			sc := NewSupplierCache(testLogger(), client, SupplierCacheConfig{})
+			require.NoError(t, sc.SetSupplierState(ctx, &SupplierState{
+				Status: SupplierStatusActive, Staked: true,
+				OperatorAddress: "pokt1opA", Services: []string{"svc1"},
+			}))
+			require.NoError(t, sc.SetSupplierState(ctx, &SupplierState{
+				Status: SupplierStatusActive, Staked: true,
+				OperatorAddress: "pokt1opB", Services: []string{"svc1"},
+			}))
+
+			require.NoError(t, sc.handleInvalidation(ctx, tc.payload))
+			assertSurvives(t, tc.payload, sc.localCache.Size())
+		})
+	}
+}

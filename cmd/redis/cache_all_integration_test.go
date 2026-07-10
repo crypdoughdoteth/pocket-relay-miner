@@ -5,9 +5,11 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	"github.com/stretchr/testify/assert"
@@ -43,17 +45,22 @@ func (q *countingAppQueryClient) InvalidateApplication(_ string) {}
 //   - healthy suppliers never read back nil/empty (any nil is the 503 window),
 //   - the contaminated supplier entry is deleted,
 //   - healthy supplier entries survive (their L2 is preserved, so reads keep
-//     serving even if L1 were cleared),
-//   - the application L2 entry is deleted and is regenerable from L3 afterwards.
+//     serving even when the {} clear-all empties L1),
+//   - the application L2 entry is deleted by the cleanup and the application
+//     remains regenerable from L3.
 //
-// Determinism note: the cleanup publishes the `{}` clear-all payload to each
-// invalidation channel, but that payload does NOT clear L1 for the supplier or
-// application caches — `json.Unmarshal([]byte("{}"))` succeeds (no error), so the
-// `if payload == "{}"` clear-all branch inside each handleInvalidation's error
-// path is dead code. The safety contract therefore does NOT rely on L1 being
-// cleared: it relies on L2 preservation (healthy entries keep serving) and on
-// L2 deletion of regenerable entries. The test asserts that observable contract,
-// so it is deterministic regardless of async pub/sub delivery timing.
+// Overlap guarantee (not best-effort): the publishClearAll seam runs after
+// every deletion and before invalidateAllTypes returns. The test wraps it to
+// (1) assert the deletions are already visible at that instant and (2) block
+// until every reader completes at least one further full iteration — so every
+// reader provably reads AFTER the deletes while the cleanup call is still
+// in flight. Readers only stop after the cleanup returns. No sleeps.
+//
+// The {} clear-all delivery itself is asynchronous pub/sub; its L1-clearing
+// semantics are covered deterministically by direct handler tests in
+// cache/invalidation_clearall_test.go. This test's safety contract holds
+// regardless of when (or whether) the event arrives: healthy supplier L2 is
+// preserved, so even an instantly-cleared L1 re-hydrates from L2.
 func TestCleanupAll_LiveReadersUnaffected(t *testing.T) {
 	client, mr := newTestCacheClient(t)
 	logger := logging.NewLoggerFromConfig(logging.Config{Level: "error", Format: "text", Async: false})
@@ -107,14 +114,16 @@ func TestCleanupAll_LiveReadersUnaffected(t *testing.T) {
 	require.Equal(t, int64(1), appStub.getCalls.Load(), "warmup should hit L3 exactly once")
 	require.True(t, mr.Exists(appL2Key), "warmup should populate application L2")
 
-	// --- Concurrent readers + one cleanup, overlapping. ---
+	// --- Concurrent readers + one cleanup, with a provable overlap. ---
 	const readers = 8
-	const iters = 200
 
 	// A supplier read "fails" (would 503 in production) if it returns nil, an
 	// error, or an empty services list. An app read "fails" if it errors.
 	var supplierReadFailures atomic.Int64
 	var appReadFailures atomic.Int64
+
+	var stop atomic.Bool
+	iterCounts := make([]atomic.Int64, readers)
 
 	var ready sync.WaitGroup // released once every reader has done one iteration
 	var done sync.WaitGroup  // released when every reader has finished
@@ -122,10 +131,11 @@ func TestCleanupAll_LiveReadersUnaffected(t *testing.T) {
 	done.Add(readers)
 
 	for i := 0; i < readers; i++ {
+		idx := i
 		supplierReader := i%2 == 0
-		go func(supplierReader bool) {
+		go func() {
 			defer done.Done()
-			for j := 0; j < iters; j++ {
+			for j := 0; !stop.Load(); j++ {
 				if supplierReader {
 					addr := healthy[j%len(healthy)]
 					state, gErr := supplierCache.GetSupplierState(ctx, addr)
@@ -137,37 +147,81 @@ func TestCleanupAll_LiveReadersUnaffected(t *testing.T) {
 						appReadFailures.Add(1)
 					}
 				}
+				iterCounts[idx].Add(1)
 				if j == 0 {
 					ready.Done()
 				}
 			}
-		}(supplierReader)
+		}()
 	}
 
-	// Fire the cleanup once while all readers are actively looping (ready.Wait
-	// returns only after every reader is past its first iteration, so cleanup
-	// genuinely overlaps concurrent reads for the race detector).
+	// Wrap the publish seam (runs after ALL deletions, before the cleanup call
+	// returns) to pin the overlap and the post-delete state deterministically.
+	origPublish := publishClearAll
+	t.Cleanup(func() { publishClearAll = origPublish })
+
+	var contamGoneAtPublish, appL2GoneAtPublish, healthyPresentAtPublish bool
+	publishClearAll = func(pctx context.Context, c *DebugRedisClient, s cleanupScope) int {
+		// (b')(c')(d') Deletions must already be visible here — before any
+		// subscriber is told to drop L1 (invariant 4, asserted mid-flight).
+		contamGoneAtPublish = !mr.Exists(contamKey)
+		appL2GoneAtPublish = !mr.Exists(appL2Key)
+		healthyPresentAtPublish = true
+		for _, addr := range healthy {
+			if !mr.Exists("ha:supplier:" + addr) {
+				healthyPresentAtPublish = false
+			}
+		}
+
+		// Force every reader through at least one full iteration AFTER the
+		// deletes while the cleanup is still in flight: the overlap can never
+		// be vacuous. Bounded spin, no sleeps.
+		deadline := time.Now().Add(10 * time.Second)
+		snapshot := make([]int64, readers)
+		for i := range iterCounts {
+			snapshot[i] = iterCounts[i].Load()
+		}
+		for i := range iterCounts {
+			for iterCounts[i].Load() <= snapshot[i] {
+				if time.Now().After(deadline) {
+					t.Error("reader stalled: no iteration completed after deletions")
+					break
+				}
+				runtime.Gosched()
+			}
+		}
+
+		return origPublish(pctx, c, s)
+	}
+
+	// Fire the cleanup once while all readers are actively looping.
 	ready.Wait()
 	require.NoError(t, invalidateAllTypes(ctx, client, false /*dryRun*/, true /*yes*/))
+	stop.Store(true)
 	done.Wait()
 
 	// (a) No 503 window: healthy suppliers never read back nil/empty, app reads
-	//     never error, throughout the concurrent cleanup.
+	//     never error, throughout the concurrent cleanup (including the forced
+	//     post-delete iterations).
 	assert.Equal(t, int64(0), supplierReadFailures.Load(),
 		"healthy suppliers must never read back nil/empty while cleanup runs")
 	assert.Equal(t, int64(0), appReadFailures.Load(),
 		"application reads must never error while cleanup runs")
 
-	// (b) Contaminated supplier entry deleted.
-	assert.False(t, mr.Exists(contamKey), "contaminated supplier entry must be deleted by cleanup")
+	// (b)(c)(d) State at publish time (mid-cleanup, post-delete): contaminated
+	// gone, app L2 gone, healthy suppliers intact. Checked at publish time
+	// because post-cleanup reader traffic legitimately repopulates app L2 from
+	// L3 — asserting non-existence after the readers stop would race.
+	assert.True(t, contamGoneAtPublish, "contaminated supplier entry must be deleted before the clear-all publish")
+	assert.True(t, appL2GoneAtPublish, "application L2 key must be deleted before the clear-all publish")
+	assert.True(t, healthyPresentAtPublish, "healthy supplier keys must survive the delete phase")
 
-	// (c) Healthy supplier keys preserved in Redis.
+	// (c) Healthy supplier keys still present after everything settles.
 	for _, addr := range healthy {
 		assert.True(t, mr.Exists("ha:supplier:"+addr), "healthy supplier key must survive cleanup: "+addr)
 	}
 
-	// (e) Healthy supplier reads still serve after cleanup. L2 is untouched, so a
-	//     read re-hydrates from L2 even if L1 had been cleared.
+	// (e) Healthy supplier reads still serve after cleanup, with full state.
 	for _, addr := range healthy {
 		state, gErr := supplierCache.GetSupplierState(ctx, addr)
 		require.NoError(t, gErr)
@@ -175,20 +229,16 @@ func TestCleanupAll_LiveReadersUnaffected(t *testing.T) {
 		assert.Equal(t, []string{"svc1"}, state.Services, "preserved supplier must keep its services: "+addr)
 	}
 
-	// (d) Application L2 entry deleted by cleanup, and still regenerable from L3.
-	assert.False(t, mr.Exists(appL2Key), "application L2 key must be deleted by cleanup")
-
-	l3Before := appStub.getCalls.Load()
-	// Evict L1 to model the application L1 aging out. The app L1 TTL (60s) is
-	// unexported in the cache package and cannot be shrunk from here; production
-	// relies on that TTL to age L1 out because — as documented above — the `{}`
-	// clear-all does not clear the application L1. With L1 evicted and L2 already
-	// deleted by cleanup, a Get must fall through to the L3 stub.
+	// (f) Application is regenerable: evict L1 (public API), then a cold read
+	// must resolve via L3/L2. Reader goroutines may already have regenerated
+	// L2 after the cleanup — that IS the regenerable contract — so assert the
+	// read succeeds and total L3 traffic stayed sane (warmup + at least the
+	// post-cleanup refills), not an exact count.
 	require.NoError(t, appCache.Invalidate(ctx, appAddr))
 	regen, err := appCache.Get(ctx, appAddr)
 	require.NoError(t, err)
 	require.Equal(t, appAddr, regen.GetAddress())
-	assert.Equal(t, l3Before+1, appStub.getCalls.Load(),
-		"cold read after cleanup must regenerate the application from L3")
+	assert.GreaterOrEqual(t, appStub.getCalls.Load(), int64(2),
+		"post-cleanup application reads must be served by regenerating from L3")
 	assert.True(t, mr.Exists(appL2Key), "regeneration should repopulate application L2")
 }

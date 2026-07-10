@@ -307,6 +307,29 @@ func scanAllKeys(ctx context.Context, client *DebugRedisClient, pattern string) 
 	return keys, nil
 }
 
+// invalidationPayload builds the pub/sub payload for a targeted (single-key)
+// invalidation. Each cache's handleInvalidation parses a type-specific field
+// (application/account: "address", service: "service_id", supplier:
+// "operator_address") — the legacy {"key": ...} payload parsed cleanly but
+// matched no field, so remote L1s were never cleared by CLI invalidations.
+// The "key" field is kept for backward compatibility with external tooling.
+func invalidationPayload(cacheType, key string) string {
+	field := ""
+	switch cacheType {
+	case "application", "account":
+		field = "address"
+	case "service":
+		field = "service_id"
+	case "supplier":
+		field = "operator_address"
+	}
+	if field == "" {
+		// Params singletons clear their L1 on any payload.
+		return fmt.Sprintf(`{"key": %q}`, key)
+	}
+	return fmt.Sprintf(`{"key": %q, %q: %q}`, key, field, key)
+}
+
 // invalidateCache is the single-key invalidate path. Output is preserved
 // byte-identical to prior releases for backward compatibility.
 func invalidateCache(ctx context.Context, client *DebugRedisClient, cacheType, key string) error {
@@ -321,7 +344,7 @@ func invalidateCache(ctx context.Context, client *DebugRedisClient, cacheType, k
 
 	// Publish invalidation event
 	channel := fmt.Sprintf("ha:events:cache:%s:invalidate", cacheType)
-	payload := fmt.Sprintf(`{"key": "%s"}`, key)
+	payload := invalidationPayload(cacheType, key)
 
 	if err := client.Publish(ctx, channel, payload).Err(); err != nil {
 		fmt.Printf("Warning: failed to publish invalidation event: %v\n", err)
@@ -346,7 +369,7 @@ func invalidateOneQuiet(ctx context.Context, client *DebugRedisClient, cacheType
 		return fmt.Errorf("failed to delete cache key %q: %w", redisKey, err)
 	}
 	channel := fmt.Sprintf("ha:events:cache:%s:invalidate", cacheType)
-	payload := fmt.Sprintf(`{"key": "%s"}`, key)
+	payload := invalidationPayload(cacheType, key)
 	// Publish is best-effort; a missing subscriber should not fail the bulk op.
 	_ = client.Publish(ctx, channel, payload).Err()
 	if _, knownSet, err := cachePattern(cacheType); err == nil && knownSet != "" {
@@ -383,7 +406,12 @@ func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType stri
 		return nil
 	}
 
-	if total > bulkConfirmThreshold && !yes {
+	// Suppliers always require confirmation regardless of count: wiping even
+	// one healthy supplier entry rejects that supplier's relays (503) until
+	// the miner reconcile rewrites it. Other types only prompt above the
+	// bulk threshold.
+	needsConfirm := total > bulkConfirmThreshold || cacheType == "supplier"
+	if needsConfirm && !yes {
 		fmt.Printf("About to invalidate %d %s entries (pattern %q).\n", total, cacheType, pattern)
 		fmt.Printf("This publishes pub/sub invalidations and removes known-set membership.\n")
 		if cacheType == "supplier" {

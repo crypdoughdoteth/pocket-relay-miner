@@ -214,13 +214,18 @@ func TestInvalidateAllTypes_PublishesClearAllToSixChannels(t *testing.T) {
 		"ha:events:cache:account:invalidate",
 		"ha:events:cache:shared_params:invalidate",
 		"ha:events:cache:proof_params:invalidate",
+		// supplier_params subscribes on a nonstandard channel (see
+		// cache/supplier_params.go) and its L1 has no TTL — the cleanup must
+		// notify it too or running instances serve stale params until restart.
+		"ha:events:invalidate:supplier_params",
 	}
 
-	// Lock the source contract: the cleanup must publish to exactly these six
-	// cache types, no more, no fewer.
+	// Lock the source contract: the cleanup must publish to exactly these
+	// EventChannel cache types (plus the supplier_params channel above).
 	assert.ElementsMatch(t, []string{
 		"application", "service", "supplier", "account", "shared_params", "proof_params",
-	}, invalidationChannelTypes)
+	}, clearAllChannelTypes)
+	assert.ElementsMatch(t, expectedChannels, newCleanupScope(client).channels)
 
 	// miniredis' in-process subscriber delivers on an UNBUFFERED channel, so
 	// each PUBLISH blocks until read. Drain the six deliveries in a helper
@@ -263,11 +268,13 @@ func TestBuildCleanupPlan_Classification(t *testing.T) {
 	client, mr := newTestCacheClient(t)
 	seedCleanupFixture(t, mr)
 
-	plan, err := buildCleanupPlan(context.Background(), client)
+	plan, err := buildCleanupPlan(context.Background(), client, newCleanupScope(client))
 	require.NoError(t, err)
 
-	// 9 regenerable ha:cache:* keys + 1 contaminated supplier = 10 deletions.
-	assert.Len(t, plan.toDelete, 10)
+	// 9 regenerable ha:cache:* keys + 1 contaminated supplier candidate.
+	assert.Len(t, plan.cacheKeys, 9)
+	assert.Len(t, plan.supplierCandidates, 1)
+	assert.Equal(t, 10, plan.totalPlanned())
 
 	assert.Equal(t, 2, plan.deleteCounts["application"])
 	assert.Equal(t, 1, plan.deleteCounts["service"])
@@ -280,21 +287,18 @@ func TestBuildCleanupPlan_Classification(t *testing.T) {
 
 	assert.Equal(t, 2, plan.locksPreserved)
 	assert.Equal(t, 3, plan.suppliersHealthy)
-	assert.Equal(t, 1, plan.suppliersContaminated)
 	assert.Equal(t, 1, plan.supplierReadErrors)
 
-	// Field-level cross-check: the contaminated supplier is the only supplier
-	// key in toDelete; no healthy/garbage supplier leaked in.
-	var supplierDeletions []string
-	for _, k := range plan.toDelete {
-		if k == contaminatedSupplierKey {
-			supplierDeletions = append(supplierDeletions, k)
-		}
-		for _, sk := range survivingSupplierKeys {
-			assert.NotEqualf(t, sk, k, "surviving supplier %s must not be in toDelete", sk)
-		}
+	// Field-level cross-check: the contaminated supplier is the only
+	// candidate; no healthy/garbage supplier leaked in, and no supplier key
+	// leaked into the unconditional cacheKeys list.
+	assert.Equal(t, []string{contaminatedSupplierKey}, plan.supplierCandidates)
+	for _, k := range plan.cacheKeys {
+		assert.NotContainsf(t, k, "ha:supplier:", "supplier key %s must not be in cacheKeys", k)
 	}
-	assert.Equal(t, []string{contaminatedSupplierKey}, supplierDeletions)
+	for _, sk := range survivingSupplierKeys {
+		assert.NotContains(t, plan.supplierCandidates, sk)
+	}
 }
 
 func TestCacheCmd_TypeAllFlagValidation(t *testing.T) {
@@ -350,6 +354,8 @@ func TestInvalidateAllTypes_ZeroKeysCleanExit(t *testing.T) {
 }
 
 func TestCacheKeyGroup(t *testing.T) {
+	client, _ := newTestCacheClient(t)
+	scope := newCleanupScope(client)
 	cases := []struct {
 		name     string
 		redisKey string
@@ -362,7 +368,7 @@ func TestCacheKeyGroup(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, cacheKeyGroup(tc.redisKey))
+			assert.Equal(t, tc.want, cacheKeyGroup(scope, tc.redisKey))
 		})
 	}
 }
