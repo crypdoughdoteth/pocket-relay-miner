@@ -85,7 +85,7 @@ non200=$(grep -A20 'Status code distribution' /tmp/cleanup-load.txt | grep '\[' 
 # 2. PATH masks 503 as 200+empty body (known issue) — cross-check relayer
 #    rejects via Loki instead of trusting hey alone.
 now_ns=$(date +%s)000000000
-start_ns=$(date -d "${DURATION} seconds ago 10 seconds ago" +%s 2>/dev/null || date -d "-$((DURATION+10)) seconds" +%s)000000000
+start_ns=$(date -d "-$((DURATION + 10)) seconds" +%s)000000000
 rejects=$(curl -sG 'http://localhost:3100/loki/api/v1/query_range' \
   --data-urlencode 'query={app="relayer"} |= "supplier not registered with any miner"' \
   --data-urlencode "limit=5" --data-urlencode "start=${start_ns}" --data-urlencode "end=${now_ns}" \
