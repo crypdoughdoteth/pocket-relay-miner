@@ -68,9 +68,34 @@ Examples:
   pocket-relay-miner redis cache --type supplier --invalidate --all --yes
 
   # Invalidate addresses listed in a file (one per line; '#' comments allowed)
-  pocket-relay-miner redis cache --type supplier --invalidate --key-file addrs.txt`,
+  pocket-relay-miner redis cache --type supplier --invalidate --key-file addrs.txt
+
+  # Hot-safe cleanup of ALL regenerable cache keys (safe with live traffic):
+  # deletes ha:cache:* (except repopulation locks) plus contaminated
+  # ha:supplier:* entries, preserves healthy supplier entries (deleting them
+  # would 503 relays until the miner reconcile rewrites them), then publishes
+  # a clear-all event so every instance drops its L1 immediately.
+  # State keys (sessions, SMST, WAL, registry) are never touched.
+  pocket-relay-miner redis cache --type all --invalidate --all [--dry-run|--yes]`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
+
+			if cacheType == "all" {
+				// Hot-safe cleanup of every regenerable cache key. Only the
+				// bulk-invalidate form makes sense for the pseudo-type.
+				if !invalidate || !all {
+					return fmt.Errorf("--type all requires --invalidate --all")
+				}
+				if key != "" || keyFile != "" || listAll {
+					return fmt.Errorf("--type all does not support --key, --key-file, or --list")
+				}
+				client, err := CreateRedisClient(ctx)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = client.Close() }()
+				return invalidateAllTypes(ctx, client, dryRun, yes)
+			}
 
 			if invalidate {
 				// Count selectors
@@ -129,7 +154,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&cacheType, "type", "", "Cache type (application|service|supplier|shared_params|session_params|proof_params)")
+	cmd.Flags().StringVar(&cacheType, "type", "", "Cache type (application|service|supplier|shared_params|session_params|proof_params|all)")
 	cmd.Flags().StringVar(&key, "key", "", "Cache key (address, service ID, etc)")
 	cmd.Flags().BoolVar(&invalidate, "invalidate", false, "Invalidate the cache entry")
 	cmd.Flags().BoolVar(&all, "all", false, "With --invalidate, invalidate every entry matching the type's prefix")
@@ -361,6 +386,11 @@ func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType stri
 	if total > bulkConfirmThreshold && !yes {
 		fmt.Printf("About to invalidate %d %s entries (pattern %q).\n", total, cacheType, pattern)
 		fmt.Printf("This publishes pub/sub invalidations and removes known-set membership.\n")
+		if cacheType == "supplier" {
+			fmt.Printf("WARNING: relayers return 503 on supplier cache misses; wiping healthy\n")
+			fmt.Printf("supplier entries rejects their relays until the miner reconcile rewrites\n")
+			fmt.Printf("them (up to ~60s). For a hot-safe cleanup use --type all instead.\n")
+		}
 		fmt.Printf("Type 'y' to proceed (or use --yes to bypass): ")
 		reader := bufio.NewReader(os.Stdin)
 		resp, _ := reader.ReadString('\n')

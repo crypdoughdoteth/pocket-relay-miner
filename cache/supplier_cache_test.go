@@ -88,7 +88,7 @@ func TestIsContaminated(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, tc.state.isContaminated())
+			require.Equal(t, tc.want, tc.state.IsContaminated())
 		})
 	}
 }
@@ -426,7 +426,7 @@ func TestWriteAndReadSupplierStatusUnstaking(t *testing.T) {
 // TestIsActive_IsContaminated_Boundary verifies that the contamination check
 // (staked+active+empty services) is unaffected by the new IsActive semantics.
 // An unstaking+empty-services entry is NOT contamination — it is a legitimate
-// in-flight deactivation — so isContaminated must return false for it.
+// in-flight deactivation — so IsContaminated must return false for it.
 func TestIsActive_IsContaminated_Boundary(t *testing.T) {
 	unstakingEmptyServices := SupplierState{
 		Staked:                  true,
@@ -434,8 +434,8 @@ func TestIsActive_IsContaminated_Boundary(t *testing.T) {
 		Services:                []string{},
 		UnstakeSessionEndHeight: 150,
 	}
-	require.False(t, unstakingEmptyServices.isContaminated(),
-		"unstaking+empty-services is NOT contamination (isContaminated checks active, not unstaking)")
+	require.False(t, unstakingEmptyServices.IsContaminated(),
+		"unstaking+empty-services is NOT contamination (IsContaminated checks active, not unstaking)")
 	// IsActive is still true — per-service gate is IsActiveForService.
 	require.True(t, unstakingEmptyServices.IsActive(),
 		"unstaking supplier is IsActive even with no services (IsActiveForService gates per-service relay acceptance)")

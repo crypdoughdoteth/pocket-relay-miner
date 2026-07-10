@@ -103,7 +103,7 @@ type SupplierState struct {
 	UpdatedBy string `json:"updated_by,omitempty"`
 }
 
-// isContaminated returns true when the cached state looks like a failed-write
+// IsContaminated returns true when the cached state looks like a failed-write
 // artifact: staked+active with an empty services list. This anti-pattern is
 // produced by a separate bug in the write path (miner/supplier_manager.go).
 // Legitimate states that look similar are NOT contaminated:
@@ -112,7 +112,7 @@ type SupplierState struct {
 //
 // Only the exact tuple (Staked && Status==active && len(Services)==0) is
 // treated as contamination.
-func (s *SupplierState) isContaminated() bool {
+func (s *SupplierState) IsContaminated() bool {
 	return s.Staked && s.Status == SupplierStatusActive && len(s.Services) == 0
 }
 
@@ -224,7 +224,7 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 		// Defensive guard: a pre-fix binary (or a warmup before this guard
 		// existed) may have populated L1 with a contaminated entry. Evict
 		// it and treat as a miss so the caller re-hydrates via L3.
-		if cached != nil && cached.isContaminated() {
+		if cached != nil && cached.IsContaminated() {
 			supplierContaminated.WithLabelValues("l1_read").Inc()
 			c.localCache.Delete(operatorAddress)
 			c.logger.Warn().
@@ -287,7 +287,7 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 	// services) produced by a separate write-path bug. Treat as a cache miss
 	// so the miner re-hydrates a clean entry from L3 on the next refresh,
 	// and do NOT populate L1 (avoid re-infecting followers).
-	if state.isContaminated() {
+	if state.IsContaminated() {
 		supplierContaminated.WithLabelValues("l2_read").Inc()
 		c.logger.Warn().
 			Str(logging.FieldSupplierOperator, operatorAddress).
@@ -542,7 +542,7 @@ func (c *SupplierCache) WarmupFromRedis(ctx context.Context, knownSupplierAddres
 
 			// Defensive guard: skip contaminated entries during warmup so a
 			// fleet restart doesn't re-infect L1 from stale L2 data.
-			if state.isContaminated() {
+			if state.IsContaminated() {
 				supplierContaminated.WithLabelValues("warmup_skip").Inc()
 				c.logger.Debug().
 					Str(logging.FieldSupplierOperator, addr).
