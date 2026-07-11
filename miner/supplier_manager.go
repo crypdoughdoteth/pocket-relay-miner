@@ -547,27 +547,9 @@ func (m *SupplierManager) filterStakedSuppliers(ctx context.Context, supplierAdd
 			continue
 		}
 
-		// Supplier is staked. Resolve services using the ServiceConfigHistory-
-		// aware helper so we respect activation_height / deactivation_height
-		// scheduled by MsgStakeSupplier updates and MsgUnstakeSupplier. The
-		// denormalized supplier.Services field cuts too fast: poktroll
-		// schedules deactivations at the next session_end, not immediately,
-		// so a service removed mid-session must keep serving relays until
-		// its deactivation_height is reached. Same logic in reverse for
-		// services with a future activation_height.
-		var currentHeight int64
-		if m.config.BlockClient != nil {
-			if block := m.config.BlockClient.LastBlock(ctx); block != nil {
-				currentHeight = block.Height()
-			}
-		}
-		activeConfigs := supplier.GetActiveServiceConfigs(currentHeight)
-		services := make([]string, 0, len(activeConfigs))
-		for _, svc := range activeConfigs {
-			if svc != nil {
-				services = append(services, svc.ServiceId)
-			}
-		}
+		// Supplier is staked. Resolve services height-aware, with a boot-time
+		// fallback (see resolveSupplierServices).
+		services := m.resolveSupplierServices(ctx, &supplier, addr)
 		m.writeSupplierStatusToCache(ctx, addr, true, services, supplier.GetUnstakeSessionEndHeight())
 		stakedSuppliers = append(stakedSuppliers, addr)
 	}
@@ -784,31 +766,61 @@ func (m *SupplierManager) warmupSingleSupplier(ctx context.Context, supplier str
 		return nil
 	}
 
-	// Use the height-aware active set, not the denormalized supplier.Services
-	// field. poktroll schedules service additions/removals via
-	// service_config_history and only applies them at session boundaries —
-	// supplier.Services reflects the immediate view and would include
-	// services that have a deactivation_height already set, which would
-	// then be written into the cache and used for relay routing until the
-	// next warmup. filterStakedSuppliers uses this same pattern.
+	return &SupplierWarmupData{
+		OwnerAddress: chainSupplier.OwnerAddress,
+		Services:     m.resolveSupplierServices(ctx, &chainSupplier, supplier),
+	}
+}
+
+// resolveSupplierServices returns the service IDs a supplier should serve.
+//
+// Preferred source is the height-aware active set from ServiceConfigHistory:
+// poktroll schedules service additions/removals via activation_height /
+// deactivation_height applied at session boundaries, and the denormalized
+// supplier.Services snapshot cuts too fast (a service removed mid-session
+// must keep serving until its deactivation_height; same in reverse for
+// future activations).
+//
+// BOOT FALLBACK: at miner boot this runs before the first Redis block event
+// arrives, so BlockClient.LastBlock reports height 0 and the height-aware
+// set is empty for every mainnet supplier (all activation heights > 0).
+// Persisting that empty set is the contaminated tuple {staked, active,
+// services:[]}: relayers treat it as a cache miss and 503 the supplier's
+// relays until the next reconcile heals it (observed live: 1585 rejections
+// in one second after a restart). When the height is unknown, fall back to
+// the denormalized snapshot — slightly stale on scheduled changes for at
+// most one reconcile interval, never empty for a serving supplier.
+func (m *SupplierManager) resolveSupplierServices(ctx context.Context, supplier *sharedtypes.Supplier, addr string) []string {
 	var currentHeight int64
 	if m.config.BlockClient != nil {
 		if block := m.config.BlockClient.LastBlock(ctx); block != nil {
 			currentHeight = block.Height()
 		}
 	}
-	activeConfigs := chainSupplier.GetActiveServiceConfigs(currentHeight)
+
+	if currentHeight == 0 {
+		services := make([]string, 0, len(supplier.Services))
+		for _, svc := range supplier.Services {
+			if svc != nil {
+				services = append(services, svc.ServiceId)
+			}
+		}
+		supplierBootServicesFallback.Inc()
+		m.logger.Info().
+			Str(logging.FieldSupplier, addr).
+			Int("services", len(services)).
+			Msg("no block height observed yet (boot); using denormalized service snapshot until first reconcile")
+		return services
+	}
+
+	activeConfigs := supplier.GetActiveServiceConfigs(currentHeight)
 	services := make([]string, 0, len(activeConfigs))
 	for _, svc := range activeConfigs {
 		if svc != nil {
 			services = append(services, svc.ServiceId)
 		}
 	}
-
-	return &SupplierWarmupData{
-		OwnerAddress: chainSupplier.OwnerAddress,
-		Services:     services,
-	}
+	return services
 }
 
 // addSupplierWithHandoff adds a supplier with handoff validation.

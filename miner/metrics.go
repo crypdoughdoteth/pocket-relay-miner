@@ -978,6 +978,19 @@ var (
 		[]string{"reason"}, // reason: chain_query_error
 	)
 
+	// supplierBootServicesFallback counts supplier-services resolutions that
+	// used the denormalized snapshot because no block height was observed
+	// yet (miner boot). A nonzero rate outside boot windows means block
+	// events are not flowing to this miner.
+	supplierBootServicesFallback = observability.MinerFactory.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "supplier_boot_services_fallback_total",
+			Help:      "Supplier service resolutions that fell back to the denormalized snapshot because block height was unknown (boot)",
+		},
+	)
+
 	// Supplier registry metrics
 	supplierRegistryUpdatesTotal = observability.MinerFactory.NewCounterVec(
 		prometheus.CounterOpts{
