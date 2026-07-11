@@ -135,11 +135,11 @@ Examples:
 			if invalidate {
 				switch {
 				case key != "":
-					return invalidateCache(ctx, client, cacheType, key)
+					return invalidateCache(ctx, client, cacheType, key, yes)
 				case all:
 					return invalidateAll(ctx, client, cacheType, dryRun, yes)
 				case keyFile != "":
-					return invalidateFromFile(ctx, client, cacheType, keyFile, dryRun)
+					return invalidateFromFile(ctx, client, cacheType, keyFile, dryRun, yes)
 				}
 			}
 
@@ -312,6 +312,41 @@ func scanAllKeys(ctx context.Context, client *DebugRedisClient, pattern string) 
 	return keys, nil
 }
 
+// confirmProceed prints prompt, reads one stdin line, and returns true only
+// on an explicit 'y'. Callers print their own context/warnings first.
+func confirmProceed() bool {
+	fmt.Printf("Type 'y' to proceed (or use --yes to bypass): ")
+	reader := bufio.NewReader(os.Stdin)
+	resp, _ := reader.ReadString('\n')
+	return strings.TrimSpace(resp) == "y"
+}
+
+// supplierWipeWarning is shown before ANY supplier-state invalidation:
+// relayers return 503 on a supplier cache miss (fail-open covers Redis
+// errors only), so deleting a healthy entry rejects that supplier's relays
+// until the miner reconcile rewrites it.
+func supplierWipeWarning() {
+	fmt.Printf("WARNING: relayers return 503 on supplier cache misses; wiping healthy\n")
+	fmt.Printf("supplier entries rejects their relays until the miner reconcile rewrites\n")
+	fmt.Printf("them (up to ~60s). For a hot-safe cleanup use --type all instead.\n")
+}
+
+// confirmSupplierInvalidation gates every non---all supplier invalidation
+// path behind the 503 warning + prompt (unless --yes). Returns false when
+// the operator aborted.
+func confirmSupplierInvalidation(cacheType string, count int, yes bool) bool {
+	if cacheType != "supplier" || yes {
+		return true
+	}
+	fmt.Printf("About to invalidate %d supplier state entr%s.\n", count, map[bool]string{true: "y", false: "ies"}[count == 1])
+	supplierWipeWarning()
+	if !confirmProceed() {
+		fmt.Printf("Aborted. No keys were invalidated.\n")
+		return false
+	}
+	return true
+}
+
 // invalidationPayload builds the pub/sub payload for a targeted (single-key)
 // invalidation. Each cache's handleInvalidation parses a type-specific field
 // (application/account: "address", service: "service_id", supplier:
@@ -336,8 +371,12 @@ func invalidationPayload(cacheType, key string) string {
 }
 
 // invalidateCache is the single-key invalidate path. Output is preserved
-// byte-identical to prior releases for backward compatibility.
-func invalidateCache(ctx context.Context, client *DebugRedisClient, cacheType, key string) error {
+// byte-identical to prior releases for backward compatibility (except the
+// supplier confirmation gate, which guards a real 503 window).
+func invalidateCache(ctx context.Context, client *DebugRedisClient, cacheType, key string, yes bool) error {
+	if !confirmSupplierInvalidation(cacheType, 1, yes) {
+		return nil
+	}
 	redisKey := buildCacheKey(cacheType, key)
 
 	// Delete the key
@@ -420,14 +459,9 @@ func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType stri
 		fmt.Printf("About to invalidate %d %s entries (pattern %q).\n", total, cacheType, pattern)
 		fmt.Printf("This publishes pub/sub invalidations and removes known-set membership.\n")
 		if cacheType == "supplier" {
-			fmt.Printf("WARNING: relayers return 503 on supplier cache misses; wiping healthy\n")
-			fmt.Printf("supplier entries rejects their relays until the miner reconcile rewrites\n")
-			fmt.Printf("them (up to ~60s). For a hot-safe cleanup use --type all instead.\n")
+			supplierWipeWarning()
 		}
-		fmt.Printf("Type 'y' to proceed (or use --yes to bypass): ")
-		reader := bufio.NewReader(os.Stdin)
-		resp, _ := reader.ReadString('\n')
-		if strings.TrimSpace(resp) != "y" {
+		if !confirmProceed() {
 			fmt.Printf("Aborted. No keys were invalidated.\n")
 			return nil
 		}
@@ -448,10 +482,13 @@ func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType stri
 	return nil
 }
 
-func invalidateFromFile(ctx context.Context, client *DebugRedisClient, cacheType, path string, dryRun bool) error {
+func invalidateFromFile(ctx context.Context, client *DebugRedisClient, cacheType, path string, dryRun, yes bool) error {
 	keys, err := readKeyFile(path)
 	if err != nil {
 		return err
+	}
+	if !dryRun && !confirmSupplierInvalidation(cacheType, len(keys), yes) {
+		return nil
 	}
 
 	total := len(keys)

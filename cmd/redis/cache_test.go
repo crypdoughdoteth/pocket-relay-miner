@@ -100,7 +100,7 @@ func TestInvalidateFromFile_ProcessesAllLines(t *testing.T) {
 		"pokt1c\n"
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 
-	err := invalidateFromFile(context.Background(), client, "supplier", path, false)
+	err := invalidateFromFile(context.Background(), client, "supplier", path, false, true)
 	require.NoError(t, err)
 
 	assert.False(t, mr.Exists("ha:supplier:pokt1a"))
@@ -118,7 +118,7 @@ func TestInvalidateFromFile_DryRunDoesNotDelete(t *testing.T) {
 	path := filepath.Join(dir, "addrs.txt")
 	require.NoError(t, os.WriteFile(path, []byte("pokt1a\n"), 0o600))
 
-	err := invalidateFromFile(context.Background(), client, "supplier", path, true)
+	err := invalidateFromFile(context.Background(), client, "supplier", path, true, true)
 	require.NoError(t, err)
 	assert.True(t, mr.Exists("ha:supplier:pokt1a"))
 }
@@ -179,7 +179,7 @@ func TestInvalidateCache_SingleKeyPreservesBehavior(t *testing.T) {
 	client, mr := newTestCacheClient(t)
 	seedSuppliers(t, mr, "pokt1a")
 
-	err := invalidateCache(context.Background(), client, "supplier", "pokt1a")
+	err := invalidateCache(context.Background(), client, "supplier", "pokt1a", true)
 	require.NoError(t, err)
 
 	assert.False(t, mr.Exists("ha:supplier:pokt1a"))

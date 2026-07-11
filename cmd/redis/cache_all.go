@@ -1,12 +1,10 @@
 package redis
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -297,10 +295,7 @@ func invalidateAllTypes(ctx context.Context, client *DebugRedisClient, dryRun, y
 		printCleanupBreakdown(scope, plan)
 		fmt.Printf("State keys (sessions, SMST, WAL, registry) are never touched.\n")
 		fmt.Printf("First read per entity after cleanup pays an L3 chain query (~100ms) until repopulated.\n")
-		fmt.Printf("Type 'y' to proceed (or use --yes to bypass): ")
-		reader := bufio.NewReader(os.Stdin)
-		resp, _ := reader.ReadString('\n')
-		if strings.TrimSpace(resp) != "y" {
+		if !confirmProceed() {
 			fmt.Printf("Aborted. No keys were invalidated.\n")
 			return nil
 		}

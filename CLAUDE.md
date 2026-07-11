@@ -295,6 +295,30 @@ If any gate fails, fix it before reporting completion. Do NOT report "done" with
 
 **ALL session state is in Redis - no local disk storage.**
 
+### Key/Channel Construction (STRONG RULE — no exceptions)
+
+**Every Redis key and pub/sub channel MUST be built through the
+`KeyBuilder` (`transport/redis/namespace.go`, reached via `client.KB()`).**
+
+- ❌ NEVER `fmt.Sprintf("ha:...")` or any hardcoded prefix — not in
+  production code, not in the CLI, not in scripts' documentation of keys.
+- ❌ NEVER build a channel as `somePrefix + ":suffix"` with a prefix wired
+  per-component. This already caused real bugs: two shared-params caches
+  listening on different channels, and a cleanup publish with zero
+  subscribers, because `PubSubPrefix` was wired to `"ha:events"` in one
+  binary and `EventsCachePrefix()` in another.
+- ✅ One KeyBuilder method per key pattern and per channel. Publisher and
+  subscriber MUST call the SAME method — if a channel has no KB method,
+  add one; do not inline the string.
+- ✅ Namespace defaults are per-field: an operator setting only
+  `namespace.base_prefix` must still get every sub-prefix defaulted.
+  Malformed keys with empty segments (`prod::application:x`) must be
+  impossible by construction.
+- ✅ Tests: golden-string tests pin each KB method's default output
+  (changing a default string is a breaking cross-version change — mixed
+  fleets stop hearing each other); a property test asserts no KB method
+  can produce `::` under partial namespace config.
+
 ### Key Patterns
 
 Reference: See full mapping in `cmd/cmd_redis_debug.go` and subcommands
