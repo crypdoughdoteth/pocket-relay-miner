@@ -90,3 +90,41 @@ func DefaultRedisNamespaceConfig() RedisNamespaceConfig {
 		ConsumerGroupPrefix: "miners",
 	}
 }
+
+// WithDefaults returns the namespace with every empty field replaced by its
+// default, FIELD BY FIELD. A config that sets only base_prefix must still
+// get every sub-prefix defaulted — all-or-nothing defaulting produced
+// malformed keys with empty segments ("prod::application:x") when an
+// operator customized just the base. Malformed namespaces must be
+// impossible by construction.
+func (ns RedisNamespaceConfig) WithDefaults() RedisNamespaceConfig {
+	def := DefaultRedisNamespaceConfig()
+	if ns.BasePrefix == "" {
+		ns.BasePrefix = def.BasePrefix
+	}
+	if ns.CachePrefix == "" {
+		ns.CachePrefix = def.CachePrefix
+	}
+	if ns.EventsPrefix == "" {
+		ns.EventsPrefix = def.EventsPrefix
+	}
+	if ns.StreamsPrefix == "" {
+		ns.StreamsPrefix = def.StreamsPrefix
+	}
+	if ns.MinerPrefix == "" {
+		ns.MinerPrefix = def.MinerPrefix
+	}
+	if ns.SupplierPrefix == "" {
+		ns.SupplierPrefix = def.SupplierPrefix
+	}
+	if ns.MeterPrefix == "" {
+		ns.MeterPrefix = def.MeterPrefix
+	}
+	if ns.ParamsPrefix == "" {
+		ns.ParamsPrefix = def.ParamsPrefix
+	}
+	if ns.ConsumerGroupPrefix == "" {
+		ns.ConsumerGroupPrefix = def.ConsumerGroupPrefix
+	}
+	return ns
+}

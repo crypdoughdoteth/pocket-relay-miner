@@ -171,16 +171,14 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect to redis: %w", err)
 	}
 
-	// Initialize namespace config with defaults if not provided
-	namespace := cfg.Namespace
-	if namespace.BasePrefix == "" {
-		namespace = config.DefaultRedisNamespaceConfig()
-	}
-
-	// Create wrapped client with KeyBuilder and pool size for validation
+	// Create wrapped client with KeyBuilder and pool size for validation.
+	// NewKeyBuilder defaults the namespace field by field: a config that
+	// sets only base_prefix still gets every sub-prefix defaulted (the
+	// previous all-or-nothing check here produced empty segments like
+	// "prod::application:x").
 	return &Client{
 		UniversalClient: client,
-		keyBuilder:      NewKeyBuilder(namespace),
+		keyBuilder:      NewKeyBuilder(cfg.Namespace),
 		poolSize:        poolSize,
 	}, nil
 }

@@ -12,9 +12,12 @@ type KeyBuilder struct {
 	ns config.RedisNamespaceConfig
 }
 
-// NewKeyBuilder creates a new KeyBuilder with the given namespace configuration.
+// NewKeyBuilder creates a new KeyBuilder with the given namespace
+// configuration. Empty fields are defaulted individually (WithDefaults), so
+// a partially-specified namespace can never produce keys with empty
+// segments ("prod::application:x").
 func NewKeyBuilder(ns config.RedisNamespaceConfig) *KeyBuilder {
-	return &KeyBuilder{ns: ns}
+	return &KeyBuilder{ns: ns.WithDefaults()}
 }
 
 // CacheKey builds a cache key for an entity.
