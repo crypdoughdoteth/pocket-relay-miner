@@ -166,6 +166,7 @@ func RelayCmd() *cobra.Command {
 	// Optional flags
 	relayCmd.PersistentFlags().StringVar(&relay.RelayRelayerURL, "relayer-url", "", "Relayer endpoint URL")
 	relayCmd.PersistentFlags().StringVar(&relay.RelaySupplierAddr, "supplier", "", "Supplier operator address")
+	relayCmd.PersistentFlags().BoolVar(&relay.RelayAllSuppliers, "all-suppliers", false, "Load test: round-robin relays across every supplier in the current session (avoids exhausting one supplier's per-session claimable budget)")
 	relayCmd.PersistentFlags().IntVarP(&relay.RelayCount, "count", "n", 1, "Number of requests to send")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayLoadTest, "load-test", false, "Enable load test mode with concurrency")
 	relayCmd.PersistentFlags().IntVar(&relay.RelayConcurrency, "concurrency", 10, "Number of concurrent workers (load test mode)")

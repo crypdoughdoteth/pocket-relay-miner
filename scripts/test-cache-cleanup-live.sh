@@ -83,7 +83,7 @@ only_meter_capped() {
 run_load() {
   local label="$1" count="$2" out="$3" attempt failed
   for attempt in 1 2 3; do
-    $BIN relay jsonrpc --localnet --service "$SERVICE_ID" --load-test \
+    $BIN relay jsonrpc --localnet --service "$SERVICE_ID" --load-test --all-suppliers \
       -n "$count" --concurrency "$CONCURRENCY" > "$out" 2>&1 || true
     grep -E "Total Requests|Successful|Failed|Success Rate" "$out" || true
     failed=$(parse_failed "$out")
@@ -141,7 +141,7 @@ total_ok=0
 meter_capped=0
 for burst in $(seq 1 "$BURSTS"); do
   out="/tmp/cleanup-burst-${burst}.txt"
-  $BIN relay jsonrpc --localnet --service "$SERVICE_ID" --load-test \
+  $BIN relay jsonrpc --localnet --service "$SERVICE_ID" --load-test --all-suppliers \
     -n "$BURST_SIZE" --concurrency 5 > "$out" 2>&1 || true
 
   errs=$(parse_failed "$out")

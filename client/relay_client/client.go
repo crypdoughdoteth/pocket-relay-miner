@@ -441,3 +441,28 @@ func (c *RelayClient) VerifyRelayResponse(
 
 	return relayResponse, nil
 }
+
+// SessionSupplierAddresses returns the operator addresses of every supplier
+// in the app's current session for serviceID. Load tests use this to spread
+// relays across the whole session instead of exhausting a single supplier's
+// per-session claimable budget.
+func (c *RelayClient) SessionSupplierAddresses(ctx context.Context, serviceID string) ([]string, error) {
+	app, err := c.queryClients.Application().GetApplication(ctx, c.appAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch application %s: %w", c.appAddress, err)
+	}
+	session, err := c.getSession(ctx, &app, serviceID, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session: %w", err)
+	}
+	addrs := make([]string, 0, len(session.Suppliers))
+	for _, s := range session.Suppliers {
+		if s != nil && s.OperatorAddress != "" {
+			addrs = append(addrs, s.OperatorAddress)
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("session for service %s has no suppliers", serviceID)
+	}
+	return addrs, nil
+}

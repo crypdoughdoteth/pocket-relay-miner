@@ -158,6 +158,24 @@ func runHTTPLoadTest(ctx context.Context, logger logging.Logger, relayClient *re
 		defer rateLimiter.Stop()
 	}
 
+	// Supplier targeting: fixed (--supplier / localnet default) or, with
+	// --all-suppliers, round-robin across every supplier in the current
+	// session. A single fixed supplier exhausts ITS per-session claimable
+	// budget quickly while the other session suppliers sit idle; spreading
+	// matches how a gateway distributes traffic. The list is captured once:
+	// on localnet the staked set is stable across sessions, but a mid-run
+	// session rollover on a real network could rotate suppliers out.
+	supplierAddrs := []string{RelaySupplierAddr}
+	if RelayAllSuppliers {
+		var supErr error
+		supplierAddrs, supErr = relayClient.SessionSupplierAddresses(ctx, RelayServiceID)
+		if supErr != nil {
+			return fmt.Errorf("failed to list session suppliers: %w", supErr)
+		}
+		logger.Info().Int("suppliers", len(supplierAddrs)).Msg("round-robining across session suppliers")
+	}
+	var supplierIdx atomic.Uint64
+
 	logger.Info().
 		Int("count", RelayCount).
 		Int("concurrency", RelayConcurrency).
@@ -185,7 +203,8 @@ func runHTTPLoadTest(ctx context.Context, logger logging.Logger, relayClient *re
 			// Build a FRESH relay request for this worker. Ring signatures use
 			// randomness, so each call produces different bytes even for an
 			// identical payload, matching PATH's per-request sign behaviour.
-			_, relayRequestBz, err := relayClient.BuildRelayRequest(requestCtx, RelayServiceID, RelaySupplierAddr, payloadBz)
+			supplier := supplierAddrs[supplierIdx.Add(1)%uint64(len(supplierAddrs))]
+			_, relayRequestBz, err := relayClient.BuildRelayRequest(requestCtx, RelayServiceID, supplier, payloadBz)
 			if err != nil {
 				metrics.RecordError(fmt.Errorf("build relay request: %w", err))
 				logger.Debug().
@@ -208,8 +227,9 @@ func runHTTPLoadTest(ctx context.Context, logger logging.Logger, relayClient *re
 				return
 			}
 
-			// Verify relay response signature
-			relayResponse, err := relayClient.VerifyRelayResponse(requestCtx, RelaySupplierAddr, relayResponseBz)
+			// Verify relay response signature against the supplier this
+			// request actually targeted (round-robin aware).
+			relayResponse, err := relayClient.VerifyRelayResponse(requestCtx, supplier, relayResponseBz)
 			if err != nil {
 				metrics.RecordError(fmt.Errorf("signature verification failed: %w", err))
 				logger.Debug().

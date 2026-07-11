@@ -21,4 +21,5 @@ var (
 	RelayTimeout        int
 	RelayVerbose        bool
 	RelayLocalnet       bool
+	RelayAllSuppliers   bool
 )
