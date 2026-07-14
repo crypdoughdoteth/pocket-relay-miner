@@ -256,18 +256,21 @@ func runHTTPLoadTest(ctx context.Context, logger logging.Logger, relayClient *re
 				return
 			}
 
-			// Check for JSON-RPC errors in the payload
-			var jsonrpcResp map[string]interface{}
-			if err := json.Unmarshal(relayResponse.Payload, &jsonrpcResp); err == nil {
-				// Check for JSON-RPC error field
-				if errField, hasError := jsonrpcResp["error"]; hasError && errField != nil {
-					metrics.RecordError(fmt.Errorf("JSON-RPC error: %v", errField))
-					logger.Debug().
-						Int("request_num", reqNum).
-						Interface("error", errField).
-						Msg("relay request failed (JSON-RPC error)")
-					return
-				}
+			// Inspect the signed response for a backend or JSON-RPC error. The
+			// payload is a protobuf POKTHTTPResponse, NOT raw JSON, so the check
+			// must go through CheckRelayResponseError (which deserializes the
+			// envelope and inspects the real backend status + body). A bare
+			// json.Unmarshal on the protobuf envelope always fails and silently
+			// counts backend 4xx-with-body and 200-with-JSON-RPC-error responses
+			// as load-test successes. Mirrors the diagnostic, grpc, and websocket
+			// paths, which all route through this helper.
+			if respErr := CheckRelayResponseError(relayResponse); respErr != nil {
+				metrics.RecordError(respErr)
+				logger.Debug().
+					Err(respErr).
+					Int("request_num", reqNum).
+					Msg("relay request failed (backend/JSON-RPC error)")
+				return
 			}
 
 			// Success: HTTP 200 + valid signature + no JSON-RPC error
