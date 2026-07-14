@@ -73,7 +73,7 @@ This file (CLAUDE.md) provides AI-specific guidance. For general contribution ru
 4. **Testing**
    - ✅ USE: `make test` (runs all tests)
    - ✅ USE: `make test-coverage` (generates coverage reports)
-   - ✅ USE: Test scripts in `scripts/` folder (e.g., `./scripts/test-simple-relay.sh`)
+   - ✅ USE: Test scripts in `scripts/` folder and the testing guides in `docs/testing/` (e.g., `./scripts/test-chaos.sh`, or `pocket-relay-miner relay jsonrpc --localnet --service develop-http`)
    - ❌ NEVER: Run tests without `make` unless debugging a specific package
 
 5. **Kubernetes Access**

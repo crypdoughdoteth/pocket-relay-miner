@@ -124,13 +124,17 @@ Commands:
 ### Testing Relays
 
 ```bash
-# Single relay test
+# Single relay test (direct to a relayer replica)
 pocket-relay-miner relay jsonrpc --localnet --service develop-http
 
-# Load test
+# Load test, round-robin across all session suppliers
 pocket-relay-miner relay jsonrpc --localnet --service develop-http \
-  --load-test --count 1000 --concurrency 50
+  --load-test --count 1000 --concurrency 50 --all-suppliers
 ```
+
+Full testing guides — Tilt bring-up, PATH+`hey` load, and direct-CLI testing of
+all four transports (JSON-RPC, WebSocket, gRPC, streaming) — are in
+[`docs/testing/`](docs/testing/README.md).
 
 ### Debugging Redis State
 
@@ -168,9 +172,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development workflow and guidelines
 
 ## Documentation
 
+- [`docs/testing/`](docs/testing/README.md) - Testing guides (Tilt bring-up, PATH+hey load, direct-CLI per-protocol)
 - [`docs/PROTOCOL_SPEC.md`](docs/PROTOCOL_SPEC.md) - Relay protocol specification
 - [`docs/REDIS.md`](docs/REDIS.md) - Redis architecture and key patterns
-- [`docs/TESTING.md`](docs/TESTING.md) - Testing guide
+- [`docs/CLAIM_PROOF_LIFECYCLE.md`](docs/CLAIM_PROOF_LIFECYCLE.md) - Claim/proof windows and inclusion reconciler
 - [`docs/WEBSOCKET_HANDSHAKE_PROTOCOL.md`](docs/WEBSOCKET_HANDSHAKE_PROTOCOL.md) - WebSocket protocol details
 - [`CLAUDE.md`](CLAUDE.md) - Technical reference for contributors
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) - Contribution guidelines
