@@ -24,16 +24,52 @@ failure. This is the tool for correctness testing per protocol.
   use `pocket-relay-miner`; substitute `./bin/pocket-relay-miner` if it isn't
   on your `PATH`.
 
-## The four transports
+## Transports and RPC types
 
-The relayer serves four transports; the CLI has one mode per transport:
+The relayer routes each relay to a backend by its **RPC type** — the poktroll
+`RPCType` carried in the `Rpc-Type` header (or, for gRPC, request metadata).
+poktroll defines five, and the relayer supports all of them:
 
-| Mode | Transport | Localnet service |
+| `RPCType` | Value | Backend type | Wire shape |
+|---|---|---|---|
+| `GRPC` | 1 | `grpc` | protobuf over HTTP/2 cleartext (h2c) |
+| `WEBSOCKET` | 2 | `websocket` | JSON over WebSocket |
+| `JSON_RPC` | 3 | `jsonrpc` | JSON-RPC over HTTP |
+| `REST` | 4 | `rest` | HTTP (incl. SSE streaming) |
+| `COMET_BFT` | 5 | `cometbft` | CometBFT RPC — JSON-RPC over HTTP/WS |
+
+`JSON_RPC`, `REST` and `COMET_BFT` are all JSON-over-HTTP at the wire; they
+differ only in the routing hint and the backend they map to. `GRPC` (protobuf)
+and `WEBSOCKET` are the structurally distinct ones.
+
+The CLI has one mode per transport it drives today, each sending a fixed
+`Rpc-Type`:
+
+| CLI mode | `Rpc-Type` sent |
+|---|---|
+| `jsonrpc` | 3 (JSON_RPC) |
+| `websocket` | 2 (WEBSOCKET) |
+| `grpc` | 1 (GRPC) |
+| `stream` | 4 (REST) |
+
+> **CometBFT (`RPCType` 5)** is supported by the relayer but not yet driven by a
+> CLI mode or exercised by a localnet service. It is JSON-RPC-shaped, so a
+> CometBFT backend is just a JSON-RPC-over-HTTP endpoint (e.g. a CometBFT node's
+> `:26657` RPC) that the relayer routes to on `Rpc-Type: 5`.
+
+Which backend(s) a service exposes is **per-deployment configuration**, not a
+fixed property of the relayer. The Tilt localnet configures one service per
+backend type:
+
+| Localnet service | Backend type | Backend URL |
 |---|---|---|
-| `jsonrpc` | HTTP / JSON-RPC | `develop-http` |
-| `websocket` | WebSocket | `develop-websocket` |
-| `grpc` | native gRPC (h2c) | `develop-grpc` |
-| `stream` | REST/SSE streaming | `develop-stream` |
+| `develop-http` | `jsonrpc` | `http://backend:8545` |
+| `develop-websocket` | `websocket` | `ws://backend:8545/ws` |
+| `develop-grpc` | `grpc` | `backend:50051` |
+| `develop-stream` | `rest` | `http://backend:8545/stream/sse` |
+
+On your own deployment a single service can expose several backend types at
+once; the relayer picks by the `Rpc-Type` header per relay.
 
 ## `--localnet`: zero-config defaults
 
