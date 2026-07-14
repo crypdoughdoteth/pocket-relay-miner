@@ -339,17 +339,30 @@ func invalidateSessionOnRollover(
 	}
 }
 
-// sendHTTPRelay sends a relay request via HTTP and returns the raw response bytes.
-// Uses the shared HTTP client with connection pooling to avoid TCP handshake overhead.
+// Rpc-Type header values (Reference: poktroll/x/shared/types/service.pb.go RPCType).
+const (
+	rpcTypeJSONRPC  = "3" // JSON_RPC
+	rpcTypeCometBFT = "5" // COMET_BFT (CometBFT RPC, itself JSON-RPC over HTTP)
+)
+
+// sendHTTPRelay sends a JSON-RPC (Rpc-Type 3) relay request via HTTP.
+func sendHTTPRelay(ctx context.Context, relayRequestBz []byte) ([]byte, error) {
+	return sendRelayOverHTTP(ctx, relayRequestBz, rpcTypeJSONRPC)
+}
+
+// sendRelayOverHTTP POSTs a protobuf RelayRequest to the relayer, tagging it with
+// the given Rpc-Type routing hint, and returns the raw response bytes. It uses the
+// shared HTTP client with connection pooling to avoid TCP handshake overhead.
 //
 // BEST PRACTICE: This demonstrates proper HTTP relay consumption:
-// 1. Content-Type: application/json - Required for JSON-RPC
-// 2. Rpc-Type: 3 - Tells relayer which backend type (JSON_RPC=3, REST=4, etc.)
-// 3. Accept-Encoding: gzip - Request compressed responses (RFC 7231)
+//  1. Content-Type: application/x-protobuf - the body is a protobuf RelayRequest
+//  2. Rpc-Type - tells the relayer which backend type to route to (3=JSON_RPC,
+//     4=REST, 5=CometBFT, ...)
+//  3. Accept-Encoding: gzip - request compressed responses (RFC 7231)
 //
 // Note: Go's http.Client automatically handles Accept-Encoding and decompression
 // when DisableCompression is false (the default).
-func sendHTTPRelay(ctx context.Context, relayRequestBz []byte) ([]byte, error) {
+func sendRelayOverHTTP(ctx context.Context, relayRequestBz []byte, rpcType string) ([]byte, error) {
 	// Build URL: {relayerURL}/{serviceID}
 	url := fmt.Sprintf("%s/%s", RelayRelayerURL, RelayServiceID)
 
@@ -364,8 +377,7 @@ func sendHTTPRelay(ctx context.Context, relayRequestBz []byte) ([]byte, error) {
 	req.Header.Set("Content-Type", "application/x-protobuf")
 
 	// Rpc-Type: Backend routing hint (Reference: poktroll/x/shared/types/service.pb.go)
-	// Values: 1=GRPC, 2=WEBSOCKET, 3=JSON_RPC, 4=REST
-	req.Header.Set("Rpc-Type", "3") // JSON_RPC = 3
+	req.Header.Set("Rpc-Type", rpcType)
 
 	// === Compression (RFC 7231 compliance) ===
 	// Accept-Encoding is automatically added by Go's http.Client when DisableCompression=false

@@ -24,6 +24,7 @@ Modes:
   websocket - Send WebSocket relay requests
   grpc      - Send gRPC relay requests
   stream    - Send streaming relay requests (SSE/NDJSON)
+  cometbft  - Send CometBFT relay requests (RPCType 5; JSON-RPC over HTTP)
 
 Examples:
   # Send a single JSONRPC relay
@@ -291,9 +292,10 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		"websocket": true,
 		"grpc":      true,
 		"stream":    true,
+		"cometbft":  true,
 	}
 	if !validModes[mode] {
-		return fmt.Errorf("invalid mode %q. Valid modes: jsonrpc, websocket, grpc, stream", mode)
+		return fmt.Errorf("invalid mode %q. Valid modes: jsonrpc, websocket, grpc, stream, cometbft", mode)
 	}
 
 	// Validate concurrency (security: prevent resource exhaustion)
@@ -410,6 +412,8 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		return relay.RunGRPCMode(cmd.Context(), logger, relayClient)
 	case "stream":
 		return relay.RunStreamMode(cmd.Context(), logger, relayClient)
+	case "cometbft":
+		return relay.RunCometBFTMode(cmd.Context(), logger, relayClient)
 	default:
 		return fmt.Errorf("mode %q not yet implemented", mode)
 	}
