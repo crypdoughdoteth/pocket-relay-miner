@@ -51,11 +51,11 @@ The CLI has one mode per transport it drives today, each sending a fixed
 | `websocket` | 2 (WEBSOCKET) |
 | `grpc` | 1 (GRPC) |
 | `stream` | 4 (REST) |
+| `cometbft` | 5 (COMET_BFT) |
 
-> **CometBFT (`RPCType` 5)** is supported by the relayer but not yet driven by a
-> CLI mode or exercised by a localnet service. It is JSON-RPC-shaped, so a
-> CometBFT backend is just a JSON-RPC-over-HTTP endpoint (e.g. a CometBFT node's
-> `:26657` RPC) that the relayer routes to on `Rpc-Type: 5`.
+The `cometbft` mode sends a CometBFT JSON-RPC request (default `status`); a
+CometBFT backend is just a JSON-RPC-over-HTTP endpoint (e.g. a CometBFT node's
+`:26657` RPC) that the relayer routes to on `Rpc-Type: 5`.
 
 Which backend(s) a service exposes is **per-deployment configuration**, not a
 fixed property of the relayer. The Tilt localnet configures one service per
@@ -67,6 +67,7 @@ backend type:
 | `develop-websocket` | `websocket` | `ws://backend:8545/ws` |
 | `develop-grpc` | `grpc` | `backend:50051` |
 | `develop-stream` | `rest` | `http://backend:8545/stream/sse` |
+| `develop-cometbft` | `cometbft` | `http://validator:26657` |
 
 On your own deployment a single service can expose several backend types at
 once; the relayer picks by the `Rpc-Type` header per relay.
@@ -94,6 +95,7 @@ pocket-relay-miner relay jsonrpc   --localnet --service develop-http
 pocket-relay-miner relay websocket --localnet --service develop-websocket
 pocket-relay-miner relay grpc      --localnet --service develop-grpc
 pocket-relay-miner relay stream    --localnet --service develop-stream --batches 3
+pocket-relay-miner relay cometbft  --localnet --service develop-cometbft
 ```
 
 Notes per protocol:
@@ -114,6 +116,12 @@ Notes per protocol:
   are never discarded). `-n`/`--count` does **not** apply to stream (use
   `--batches`), and `--load-test` is not supported. Each batch is
   signature-verified individually.
+- **cometbft** — sends a CometBFT JSON-RPC request (default `status`) tagged
+  `Rpc-Type: 5`; the localnet `develop-cometbft` service routes it to the
+  validator's CometBFT RPC (`validator:26657`), so the response is the real node
+  `status` (network, moniker, latest block height). Use `--payload` to call a
+  different method (e.g. `health`, `abci_info`). Diagnostic only — load testing
+  goes through `jsonrpc`.
 
 ## Load testing (`--load-test`)
 
