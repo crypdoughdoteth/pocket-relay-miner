@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
@@ -30,15 +31,24 @@ type recordingProcessor struct {
 	calls        atomic.Int32
 	lastReqBody  []byte
 	lastRespBody []byte
+	// lastPublishBudget is time.Until(publishCtx deadline) captured at the
+	// moment ProcessRelay runs. It measures how much of grpcPublishTimeout is
+	// actually left for publishing AFTER the backend forward.
+	lastPublishBudget      time.Duration
+	lastPublishHasDeadline bool
 }
 
 func (p *recordingProcessor) ProcessRelay(
-	_ context.Context,
+	ctx context.Context,
 	reqBody, respBody []byte,
 	supplierAddr, serviceID string,
 	_ int64,
 ) (*transport.MinedRelayMessage, error) {
 	p.calls.Add(1)
+	if dl, ok := ctx.Deadline(); ok {
+		p.lastPublishHasDeadline = true
+		p.lastPublishBudget = time.Until(dl)
+	}
 	// Copy: forwardToBackend's buffer pool may recycle the backing array.
 	p.lastReqBody = append([]byte(nil), reqBody...)
 	p.lastRespBody = append([]byte(nil), respBody...)
@@ -241,4 +251,41 @@ func TestHandleSendRelay_SuccessMinesRawBackendBody(t *testing.T) {
 	var gotReq servicetypes.RelayRequest
 	require.NoError(t, gotReq.Unmarshal(fx.proc.lastReqBody))
 	require.Equal(t, fx.supplier, gotReq.Meta.SupplierOperatorAddress)
+}
+
+// TestHandleSendRelay_PublishBudgetFreshAfterSlowBackend proves the detached
+// publish context gets its full grpcPublishTimeout budget measured from PUBLISH
+// time, not from handler entry. The budget must not be consumed by backend
+// latency: an already-served relay that took a while at the backend must still
+// have (nearly) the whole publish window left, or a slow-but-successful relay
+// silently fails to reach the WAL (lost reward) -- a divergence from the HTTP
+// path, which publishes on a fresh context created after the backend returns.
+func TestHandleSendRelay_PublishBudgetFreshAfterSlowBackend(t *testing.T) {
+	// A backend that takes a noticeable slice of wall-clock before answering.
+	// If publishCtx's clock starts at handler entry, this latency is charged
+	// against the 30s publish budget; if it starts at publish time, it is not.
+	const backendDelay = 300 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(backendDelay)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":"0x1","id":1}`))
+	}))
+	defer backend.Close()
+
+	fx := newGRPCPublishFixture(t, backend.URL)
+
+	err := fx.svc.handleSendRelay(fx.stream)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), fx.proc.calls.Load())
+	require.True(t, fx.proc.lastPublishHasDeadline, "publish context must carry a bounded deadline")
+
+	// The remaining budget at publish time must be within ~backendDelay of the
+	// full grpcPublishTimeout. Tolerance (100ms) comfortably covers the
+	// microsecond gap between the backend returning and publishCtx being
+	// created, but is far smaller than backendDelay, so the old
+	// created-at-entry behaviour (budget = 30s - ~300ms) fails this bound.
+	require.Greater(t, fx.proc.lastPublishBudget, grpcPublishTimeout-100*time.Millisecond,
+		"publish budget must be measured from publish time, not handler entry "+
+			"(got %s left of %s after a %s backend)", fx.proc.lastPublishBudget, grpcPublishTimeout, backendDelay)
 }

@@ -268,15 +268,6 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	ctx, cancel := context.WithTimeout(ctx, serviceTimeout)
 	defer cancel()
 
-	// publishCtx detaches the mining + WAL publish from the request lifetime. The
-	// signed response is returned to the client BEFORE ProcessRelay/Publish run, so
-	// publication must survive client cancellation and must not inherit the backend
-	// service timeout (whose budget is already spent). Otherwise an already-served
-	// relay can silently fail to reach the WAL — no session/claim/proof, lost
-	// reward. Mirrors the HTTP path, which publishes via a detached context.
-	publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), grpcPublishTimeout)
-	defer publishCancel()
-
 	// Validate and meter the relay if pipeline is available
 	if s.relayPipeline != nil {
 		// TODO: Get actual compute units from service config
@@ -447,6 +438,20 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				Err(err).
 				Msg("failed to marshal relay request for processing")
 		} else {
+			// publishCtx detaches the mining + WAL publish from the request
+			// lifetime. It is created HERE — after the backend forward and after
+			// the signed response was already sent to the client — so its full
+			// grpcPublishTimeout budget starts at publish time, NOT at handler
+			// entry. Creating it earlier would let a slow-but-successful backend
+			// consume the budget: an already-served relay would then fail to
+			// publish (context deadline exceeded) and never reach the WAL — no
+			// session/claim/proof, lost reward. context.WithoutCancel drops the
+			// request/backend deadline (already spent) while keeping publication
+			// alive past client cancellation. Mirrors the HTTP path, which
+			// publishes on a fresh detached context created at publish time.
+			publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), grpcPublishTimeout)
+			defer publishCancel()
+
 			// Mine the RAW backend response body, exactly like the HTTP path
 			// (proxy.go executePublish passes task.respBody). ProcessRelay builds
 			// and signs its OWN RelayResponse over this body and derives
