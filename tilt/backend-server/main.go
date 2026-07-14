@@ -185,6 +185,19 @@ func handleJSONRPC(cfg *Config) http.HandlerFunc {
 			log.Printf("  %s: %s", name, strings.Join(values, ", "))
 		}
 
+		// Mimic a strict JSON-RPC backend (e.g. Anvil/Foundry): require
+		// Content-Type application/json and otherwise return JSON-RPC -32600
+		// "Invalid request". A lenient backend hid a relayer bug where the relay
+		// envelope's Content-Type (application/x-protobuf) leaked to the backend
+		// instead of the inner request's application/json.
+		if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			log.Printf("[STRICT] rejecting non-json Content-Type %q with -32600", ct)
+			requestsTotal.WithLabelValues("http", "invalid_content_type").Inc()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}`)
+			return
+		}
+
 		// Apply delay if configured
 		if cfg.DelayMs > 0 {
 			time.Sleep(time.Duration(cfg.DelayMs) * time.Millisecond)
