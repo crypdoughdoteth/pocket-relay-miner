@@ -168,13 +168,13 @@ func RelayCmd() *cobra.Command {
 	relayCmd.PersistentFlags().StringVar(&relay.RelaySupplierAddr, "supplier", "", "Supplier operator address")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayAllSuppliers, "all-suppliers", false, "Load test: round-robin relays across every supplier in the current session (avoids exhausting one supplier's per-session claimable budget)")
 	relayCmd.PersistentFlags().IntVarP(&relay.RelayCount, "count", "n", 1, "Number of requests to send (jsonrpc/websocket/grpc load test)")
-	relayCmd.PersistentFlags().IntVar(&relay.RelayBatches, "batches", 0, "stream mode: number of signed SSE batches to collect before closing (defaults to -n)")
+	relayCmd.PersistentFlags().IntVar(&relay.RelayBatches, "batches", 0, "stream mode: ask the backend to emit this many SSE batches then close (0 = receive until the server closes or --timeout)")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayLoadTest, "load-test", false, "Enable load test mode with concurrency")
 	relayCmd.PersistentFlags().IntVar(&relay.RelayConcurrency, "concurrency", 10, "Number of concurrent workers (load test mode)")
 	relayCmd.PersistentFlags().IntVar(&relay.RelayRPS, "rps", 0, "Target requests per second (0 = unlimited, only for load test mode)")
 	relayCmd.PersistentFlags().StringVar(&relay.RelayPayloadJSON, "payload", "", "Custom JSON-RPC payload (default: eth_blockNumber)")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayOutputJSON, "output-json", false, "Output results as JSON")
-	relayCmd.PersistentFlags().IntVar(&relay.RelayTimeout, "timeout", 30, "Request timeout in seconds")
+	relayCmd.PersistentFlags().IntVar(&relay.RelayTimeout, "timeout", 120, "Request timeout in seconds (also the max time a stream is read before giving up)")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayVerbose, "verbose", false, "Verbose logging")
 
 	return relayCmd
@@ -306,20 +306,22 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--rps requires --load-test flag (RPS targeting only works in load test mode)")
 	}
 
-	// Streams are long-lived by design: load test mode does not apply, and
-	// --batches counts SSE batches to collect in one stream; it only applies to
-	// stream mode.
+	// --batches asks the backend to emit that many SSE batches then close; it is a
+	// stream-only control. -n/--count is the request/load-test count for the other
+	// modes and has no meaning for stream (a stream is read until the server closes
+	// or --timeout fires). Reject both cross-mode uses before any client or key is
+	// initialized, and point users at the right flag instead of silently ignoring.
 	if relay.RelayBatches < 0 {
 		return fmt.Errorf("--batches must be non-negative")
 	}
 	if relay.RelayBatches > 0 && mode != "stream" {
 		return fmt.Errorf("--batches only applies to stream mode (other modes use -n/--count)")
 	}
-	// Streams are long-lived: --load-test does not apply, and --batches (or -n as
-	// a fallback) bounds how many batches to collect. Fail here, before query
-	// clients and keys are initialized.
+	if mode == "stream" && relay.RelayCount > 1 {
+		return fmt.Errorf("-n/--count does not apply to stream mode (a stream is read until the server closes; use --batches to ask the backend for a bounded number of SSE batches)")
+	}
 	if mode == "stream" && relay.RelayLoadTest {
-		return fmt.Errorf("load test mode is not supported for streaming relays (use --batches to bound how many SSE batches to collect)")
+		return fmt.Errorf("load test mode is not supported for streaming relays (use --batches to ask the backend for a bounded number of SSE batches)")
 	}
 
 	// Warn if load test flags are used without --load-test
@@ -327,7 +329,7 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		if relay.RelayConcurrency > 1 && cmd.Flags().Changed("concurrency") {
 			return fmt.Errorf("--concurrency requires --load-test flag (diagnostic mode only supports single requests)")
 		}
-		if relay.RelayCount > 1 && mode != "stream" {
+		if relay.RelayCount > 1 {
 			return fmt.Errorf("-n/--count > 1 requires --load-test flag (diagnostic mode sends exactly 1 relay, use --load-test for multiple requests)")
 		}
 	}

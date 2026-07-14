@@ -103,12 +103,17 @@ Notes per protocol:
   gRPC (h2c) forwarding end to end, and prints the decoded `Block Height`.
   Passing `--payload '<json>'` instead sends a JSON-RPC body, which
   deliberately drives the relayer's REST fallback for gRPC relays.
-- **stream** — the SSE stream is long-lived. The CLI collects batches until the
-  server closes the stream (natural end) **or** it has collected `--batches N`
-  (default 1), whichever comes first, then closes. A bound is needed because a
-  subscription-style feed (like the localnet demo endpoint) never ends on its
-  own. It does not use `--load-test`. Each batch is signature-verified
-  individually. (`-n` is still honored as a fallback for `--batches`.)
+- **stream** — the CLI reads the SSE stream until the **server closes it** (EOF)
+  or the client `--timeout` (default 120s) fires, collecting *every* signed batch
+  the service sends. This mirrors mainnet/beta, where the client cannot know how
+  many batches a service will emit — it just drains until close. `--batches N`
+  asks the demo backend (localnet only) to emit exactly `N` batches and then
+  close, so `--batches 5` returns 5 batches and exits in ~1s instead of streaming
+  forever. Without `--batches`, the localnet demo feed is infinite, so the run
+  ends on `--timeout` and returns whatever it collected (batches already received
+  are never discarded). `-n`/`--count` does **not** apply to stream (use
+  `--batches`), and `--load-test` is not supported. Each batch is
+  signature-verified individually.
 
 ## Load testing (`--load-test`)
 
