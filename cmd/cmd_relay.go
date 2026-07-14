@@ -43,11 +43,12 @@ Examples:
 // Relay command flags are now in the relay package (relay.relay.RelayAppPrivKey, etc.)
 
 // Localnet defaults (from tilt/config/all-keys.yaml)
-// Genesis has 4 services with corresponding apps:
+// Genesis has 5 services with corresponding apps:
 //   - develop-http      -> app1 (pokt1mrqt5f7qh8uxs27cjm9t7v9e74a9vvdnq5jva4)
 //   - develop-websocket -> app2 (pokt184zvylazwu4queyzpl0gyz9yf5yxm2kdhh9hpm)
 //   - develop-stream    -> app3 (pokt1lqyu4v88vp8tzc86eaqr4lq8rwhssyn6rfwzex)
 //   - develop-grpc      -> app4 (pokt1pn64d94e6u5g8cllsnhgrl6t96ysnjw59j5gst)
+//   - develop-cometbft  -> app5 (pokt1ppuhmrhphj0gawkhrs7d45u85gp4fw06tjg3j5)
 //
 // All apps delegate to gateway1 (pokt15vzxjqklzjtlz7lahe8z2dfe9nm5vxwwmscne4)
 const (
@@ -56,6 +57,7 @@ const (
 	localnetApp2PrivKey = "7e7571a8c61b0887ff8a9017bb4ad83c016b193234f9dc8b6a8ce10c7c483600" // develop-websocket
 	localnetApp3PrivKey = "7cbbaa043b9b63baa7d6bb087483b0a6a9f82596c19dce4c5028eb43e5b63674" // develop-stream
 	localnetApp4PrivKey = "84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57" // develop-grpc
+	localnetApp5PrivKey = "50058b14b956cd3071aad111f3f2a0d9a00b7028edde6c713e838b7522a626de" // develop-cometbft
 
 	// Gateway private key (all apps delegate to this gateway)
 	// When --gateway-priv-key is provided, relays are signed with this key on behalf of the app
@@ -79,6 +81,7 @@ var localnetAppKeys = map[string]string{
 	"develop-websocket": localnetApp2PrivKey,
 	"develop-stream":    localnetApp3PrivKey,
 	"develop-grpc":      localnetApp4PrivKey,
+	"develop-cometbft":  localnetApp5PrivKey,
 }
 
 // validateURL validates a URL and ensures it uses an allowed scheme.

@@ -51,6 +51,16 @@ services:
       grpc:
         url: "backend:50051"
 
+  # CometBFT (RPCType 5) routes to the validator's CometBFT RPC (JSON-RPC over HTTP).
+  develop-cometbft:
+    validation_mode: eager
+    timeout_profile: fast
+    max_body_size_bytes: 10485760
+    default_backend: cometbft
+    backends:
+      cometbft:
+        url: "http://validator:26657"
+
 default_validation_mode: optimistic
 default_request_timeout_seconds: 30
 default_max_body_size_bytes: 10485760

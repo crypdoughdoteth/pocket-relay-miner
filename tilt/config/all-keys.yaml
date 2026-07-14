@@ -27,6 +27,10 @@ accounts:
     address: pokt1pn64d94e6u5g8cllsnhgrl6t96ysnjw59j5gst
     private_key: 84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57
     mnemonic: "blade light diagram grocery quit orchard patient wonder usual category later want offer increase blush this business protect village top cricket laundry holiday measure"
+  - name: app5
+    address: pokt1ppuhmrhphj0gawkhrs7d45u85gp4fw06tjg3j5
+    private_key: 50058b14b956cd3071aad111f3f2a0d9a00b7028edde6c713e838b7522a626de
+    mnemonic: "arena please come track field recycle purse logic tail boil maple jump country seat ritual move cheap claw antique old castle test upon alert"
   - name: supplier1
     address: pokt19a3t4yunp0dlpfjrp7qwnzwlrzd5fzs2gjaaaj
     private_key: cd41a98ac7ac3b190c345b88e2885422d7bb553c59bca03c6e2618d49f8b1c06

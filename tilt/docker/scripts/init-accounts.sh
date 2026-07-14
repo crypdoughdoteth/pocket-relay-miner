@@ -62,11 +62,12 @@ register_key() {
 # This is the gateway address: pokt15vzxjqklzjtlz7lahe8z2dfe9nm5vxwwmscne4
 GATEWAY_KEY="cf09805c952fa999e9a63a9f434147b0a5abfd10f268879694c6b5a70e1ae177"
 
-# App private keys from all-keys.yaml (app1-app4)
+# App private keys from all-keys.yaml (app1-app5)
 APP_KEYS="2d00ef074d9b51e46886dc9a1df11e7b986611d0f336bdcf1f0adce3e037ec0a
 7e7571a8c61b0887ff8a9017bb4ad83c016b193234f9dc8b6a8ce10c7c483600
 7cbbaa043b9b63baa7d6bb087483b0a6a9f82596c19dce4c5028eb43e5b63674
-84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57"
+84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57
+50058b14b956cd3071aad111f3f2a0d9a00b7028edde6c713e838b7522a626de"
 
 # Supplier private keys from all-keys.yaml (supplier1-supplier15)
 SUPPLIER_KEYS="cd41a98ac7ac3b190c345b88e2885422d7bb553c59bca03c6e2618d49f8b1c06

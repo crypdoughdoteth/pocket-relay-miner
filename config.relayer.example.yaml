@@ -150,6 +150,18 @@ services:
         url: "backend:50051"
         # [PRODUCTION] url: "eth-node:50051"
 
+  # CometBFT service (localnet) — routes RPCType 5 to the validator's CometBFT RPC.
+  # CometBFT RPC is JSON-RPC over HTTP, so the backend is a plain HTTP endpoint.
+  develop-cometbft:
+    validation_mode: eager
+    timeout_profile: fast
+    max_body_size_bytes: 10485760
+    default_backend: cometbft
+    backends:
+      cometbft:
+        url: "http://validator:26657"
+        # [PRODUCTION] url: "http://cometbft-node:26657"
+
   # Example: text-generation service with streaming profile
   # This demonstrates using the "streaming" timeout profile for long-running LLM requests
   # The profile defines request_timeout_seconds (600s) and response_header_timeout (0 for streaming)
