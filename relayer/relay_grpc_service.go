@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for grpc-encoding: gzip
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -27,6 +29,14 @@ import (
 // RelayServiceMethodPath is the gRPC method path for the relay service.
 // Clients (e.g., PATH gateway) call this method with a RelayRequest message.
 const RelayServiceMethodPath = "/pocket.service.RelayService/SendRelay"
+
+// errBackendMisconfigured marks failures that happen before any network call:
+// missing backend, an unparseable/undialable backend URL, or a scheme that
+// cannot be dialed for the resolved RPC type. These are operator/config errors,
+// not backend health signals, so they MUST NOT feed the circuit breaker — a
+// handful of misrouted relays used to trip the shared endpoint's breaker and
+// fast-fail the whole service. Callers use errors.Is to skip RecordResult.
+var errBackendMisconfigured = errors.New("backend misconfigured for relay type")
 
 // RelayGRPCService implements a gRPC service that properly handles the relay protocol.
 // It receives RelayRequest messages, extracts metadata, forwards to backends, and
@@ -41,6 +51,13 @@ type RelayGRPCService struct {
 
 	// Function to get HTTP client for a service (supports per-service timeout profiles)
 	getHTTPClient func(serviceID string) *http.Client
+
+	// grpcHTTPClient dials gRPC backends over HTTP/2 cleartext (h2c) with prior
+	// knowledge -- the wire form of a native gRPC unary/server-streaming call.
+	// The per-service HTTP/1.1 client cannot speak it, so gRPC forwarding uses
+	// this dedicated client. Per-service timeouts still apply through the
+	// request context (set in handleSendRelay), same as the HTTP path.
+	grpcHTTPClient *http.Client
 
 	// Function to get service timeout (from timeout profile)
 	getServiceTimeout func(serviceID string) time.Duration
@@ -124,6 +141,22 @@ func NewRelayGRPCService(logger logging.Logger, config RelayGRPCServiceConfig) *
 		bufferPool = NewBufferPool(maxBodySize)
 	}
 
+	// Dedicated client for forwarding to gRPC backends. h2c (HTTP/2 cleartext,
+	// prior knowledge) with HTTP/1.1 disabled is exactly how a native gRPC
+	// client opens a non-TLS connection. No client-level Timeout: the per-request
+	// context deadline (service timeout) governs, matching the HTTP path.
+	grpcTransport := &http.Transport{}
+	grpcTransport.Protocols = new(http.Protocols)
+	grpcTransport.Protocols.SetUnencryptedHTTP2(true)
+	grpcTransport.Protocols.SetHTTP1(false)
+	grpcHTTPClient := &http.Client{
+		Transport: grpcTransport,
+		// Never follow redirects -- pass them through, as the HTTP client does.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	return &RelayGRPCService{
 		logger:             logger.With().Str(logging.FieldComponent, "grpc_relay_service").Logger(),
 		serviceConfigs:     config.ServiceConfigs,
@@ -135,6 +168,7 @@ func NewRelayGRPCService(logger logging.Logger, config RelayGRPCServiceConfig) *
 		maxBodySize:        maxBodySize,
 		bufferPool:         bufferPool,
 		getHTTPClient:      getHTTPClient,
+		grpcHTTPClient:     grpcHTTPClient,
 		getServiceTimeout:  getServiceTimeout,
 		getPool:            config.GetPool,
 		getBackendConfig:   config.GetBackendConfig,
@@ -282,16 +316,15 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 		Int("body_size", len(poktHTTPRequest.BodyBz)).
 		Msg("deserialized POKTHTTPRequest from relay payload")
 
-	// Resolve backend via pool-based API for circuit breaker integration.
-	// Determine RPC type for pool lookup (same logic as forwardToBackend).
-	grpcRPCType := "rest"
-	if poktHTTPRequest.Header != nil {
-		if ctHeader, ok := poktHTTPRequest.Header["Content-Type"]; ok && len(ctHeader.Values) > 0 {
-			if strings.HasPrefix(ctHeader.Values[0], "application/grpc") {
-				grpcRPCType = "grpc"
-			}
-		}
-	}
+	// Resolve backend RPC type for pool lookup and forwarding. Precedence mirrors
+	// the HTTP path (proxy.go:719-728): the client's declared "rpc-type" gRPC
+	// metadata wins, then the inner Content-Type heuristic, then the service
+	// default. Honouring the metadata is what fixes native gRPC relays -- the CLI
+	// declares metadata.Pairs("rpc-type","1"); the inner request is still typed
+	// application/json, so the old Content-Type-only logic mislabeled every gRPC
+	// relay as "rest" and misrouted it.
+	md, _ := metadata.FromIncomingContext(ctx)
+	grpcRPCType := resolveGRPCRelayRPCType(md, poktHTTPRequest, &svcConfig)
 
 	var grpcEndpoint *pool.BackendEndpoint
 	var grpcPool *pool.Pool
@@ -310,10 +343,14 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	grpcEndpoint = grpcPool.Next()
 
 	// Forward request to backend and get response
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
 
-	// Record result for circuit breaker (covers both success and error paths)
-	if grpcEndpoint != nil && grpcPool != nil {
+	// Record result for circuit breaker (covers both success and network-error
+	// paths). Config/misroute errors (errBackendMisconfigured) are excluded: the
+	// breaker measures backend health, and a misrouted relay that never touched
+	// the network says nothing about it -- counting it would fast-fail the whole
+	// endpoint on a handful of mistyped relays.
+	if grpcEndpoint != nil && grpcPool != nil && !errors.Is(err, errBackendMisconfigured) {
 		threshold := s.getCircuitBreakerThreshold(serviceID, grpcRPCType)
 		transition := grpcPool.RecordResult(grpcEndpoint, respStatus, err, threshold)
 		if transition != nil {
@@ -452,24 +489,18 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 // forwardToBackend forwards the request to the appropriate backend service.
 // If endpoint is non-nil, its URL is used for backend selection (pool-based).
 // Otherwise, falls back to config-based URL lookup (legacy path).
+//
+// rpcType is resolved by the caller (see resolveGRPCRelayRPCType) so backend
+// selection, URL normalization, and transport choice all follow the client's
+// declared transport rather than re-deriving it from the inner Content-Type.
 func (s *RelayGRPCService) forwardToBackend(
 	ctx context.Context,
 	serviceID string,
 	svcConfig *ServiceConfig,
 	poktHTTPRequest *sdktypes.POKTHTTPRequest,
 	endpoint *pool.BackendEndpoint,
+	rpcType string,
 ) ([]byte, http.Header, int, error) {
-	// Determine RPC type from content-type or use default
-	rpcType := "rest"
-	if poktHTTPRequest.Header != nil {
-		if ctHeader, ok := poktHTTPRequest.Header["Content-Type"]; ok && len(ctHeader.Values) > 0 {
-			contentType := ctHeader.Values[0]
-			if strings.HasPrefix(contentType, "application/grpc") {
-				rpcType = "grpc"
-			}
-		}
-	}
-
 	// Find the backend configuration
 	var backendURL string
 	var configHeaders map[string]string
@@ -506,7 +537,15 @@ func (s *RelayGRPCService) forwardToBackend(
 	}
 
 	if backendURL == "" {
-		return nil, nil, 0, fmt.Errorf("no backend configured for service %s", serviceID)
+		return nil, nil, 0, fmt.Errorf("%w: no backend configured for service %s", errBackendMisconfigured, serviceID)
+	}
+
+	// Normalize the backend URL for the resolved RPC type. gRPC backends are
+	// conventionally configured as bare host:port (e.g. "backend:50051"), which
+	// url.Parse reads as scheme "backend" and http.NewRequest then rejects.
+	backendURL, err := normalizeBackendURLForRPCType(backendURL, rpcType)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("%w: %v", errBackendMisconfigured, err)
 	}
 
 	// Build the request URL
@@ -517,7 +556,14 @@ func (s *RelayGRPCService) forwardToBackend(
 
 	backendParsed, err := url.Parse(backendURL)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("failed to parse backend URL: %w", err)
+		return nil, nil, 0, fmt.Errorf("%w: failed to parse backend URL: %v", errBackendMisconfigured, err)
+	}
+
+	// After normalization the backend must be dialable over HTTP(S); anything
+	// else (e.g. a scheme-less REST backend, or ws://) would fail deep inside
+	// http.NewRequest as a raw error and poison the breaker. Treat it as config.
+	if backendParsed.Scheme != "http" && backendParsed.Scheme != "https" {
+		return nil, nil, 0, fmt.Errorf("%w: backend scheme %q is not dialable for rpc type %q", errBackendMisconfigured, backendParsed.Scheme, rpcType)
 	}
 
 	// Merge URLs
@@ -564,8 +610,12 @@ func (s *RelayGRPCService) forwardToBackend(
 	// Set host header
 	req.Host = backendParsed.Host
 
-	// Execute request using service-specific HTTP client
+	// Execute request. gRPC backends need the dedicated h2c client; everything
+	// else uses the per-service HTTP/1.1 client with its pool/timeout profile.
 	client := s.getHTTPClient(serviceID)
+	if rpcType == BackendTypeGRPC {
+		client = s.grpcHTTPClient
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("request failed: %w", err)
@@ -579,7 +629,85 @@ func (s *RelayGRPCService) forwardToBackend(
 		return nil, nil, 0, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	return respBody, resp.Header, resp.StatusCode, nil
+	// gRPC carries its status (grpc-status/grpc-message) in HTTP trailers, sent
+	// after the body -- so they are only readable now that the body reached EOF.
+	// gRPC clients need grpc-status to interpret the reply, so fold trailers into
+	// the returned headers. This covers unary and buffered server-streaming; it
+	// does not model full-duplex streaming, which this proxy does not forward.
+	return respBody, mergeTrailersIntoHeader(resp.Header, resp.Trailer), resp.StatusCode, nil
+}
+
+// resolveGRPCRelayRPCType determines the backend RPC type for a gRPC relay.
+// Precedence mirrors the HTTP path (proxy.go:719-728): the client declares its
+// intended transport through the "rpc-type" gRPC metadata, and that intent must
+// win over the inner POKTHTTPRequest Content-Type, which is only a heuristic
+// fallback. Order: (1) metadata "rpc-type", (2) inner Content-Type
+// "application/grpc*", (3) service DefaultBackend, (4) global default.
+func resolveGRPCRelayRPCType(md metadata.MD, poktReq *sdktypes.POKTHTTPRequest, svcConfig *ServiceConfig) string {
+	// 1. Explicit client declaration via gRPC metadata (numeric code or name).
+	for _, v := range md.Get("rpc-type") {
+		if v != "" {
+			return RPCTypeToBackendType(v)
+		}
+	}
+
+	// 2. Heuristic: the inner request advertises application/grpc.
+	if poktReq != nil && poktReq.Header != nil {
+		if ct, ok := poktReq.Header["Content-Type"]; ok && len(ct.Values) > 0 {
+			if strings.HasPrefix(ct.Values[0], "application/grpc") {
+				return BackendTypeGRPC
+			}
+		}
+	}
+
+	// 3. Service-configured default backend (normalized the same as the header).
+	if svcConfig != nil && svcConfig.DefaultBackend != "" {
+		return RPCTypeToBackendType(svcConfig.DefaultBackend)
+	}
+
+	// 4. Global default.
+	return DefaultBackendType
+}
+
+// normalizeBackendURLForRPCType makes a gRPC backend URL dialable over h2c.
+// Only gRPC is rewritten: a bare host:port (the conventional gRPC backend form,
+// e.g. "backend:50051") gets an "http://" scheme so url.Parse/http.NewRequest
+// can dial it as cleartext HTTP/2. URLs that already carry http/https are left
+// alone; any other explicit scheme (ws://, ftp://, ...) is a misconfiguration.
+// Non-gRPC types are returned untouched -- a genuine problem there surfaces as
+// an undialable scheme downstream, still classified as a config error.
+func normalizeBackendURLForRPCType(backendURL, rpcType string) (string, error) {
+	if rpcType != BackendTypeGRPC {
+		return backendURL, nil
+	}
+	if strings.HasPrefix(backendURL, "http://") || strings.HasPrefix(backendURL, "https://") {
+		return backendURL, nil
+	}
+	// No "://" means a bare host:port -- treat it as h2c cleartext.
+	if scheme, _, found := strings.Cut(backendURL, "://"); found {
+		return "", fmt.Errorf("gRPC backend URL %q has undialable scheme %q", backendURL, scheme)
+	}
+	return "http://" + backendURL, nil
+}
+
+// mergeTrailersIntoHeader returns header extended with every value from trailer.
+// When trailer is empty the original header is returned unchanged (no copy).
+// Keys are canonicalized by http.Header, so callers read grpc-status via
+// Get("Grpc-Status") regardless of the wire casing.
+func mergeTrailersIntoHeader(header, trailer http.Header) http.Header {
+	if len(trailer) == 0 {
+		return header
+	}
+	merged := header.Clone()
+	if merged == nil {
+		merged = make(http.Header, len(trailer))
+	}
+	for key, values := range trailer {
+		for _, value := range values {
+			merged.Add(key, value)
+		}
+	}
+	return merged
 }
 
 // getCircuitBreakerThreshold returns the unhealthy threshold for circuit breaker evaluation.
