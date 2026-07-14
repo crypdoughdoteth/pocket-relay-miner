@@ -30,6 +30,12 @@ import (
 // Clients (e.g., PATH gateway) call this method with a RelayRequest message.
 const RelayServiceMethodPath = "/pocket.service.RelayService/SendRelay"
 
+// grpcPublishTimeout bounds the detached mining/WAL-publish work for a gRPC relay.
+// It is independent of the request/backend timeout: the response is already sent to
+// the client before publishing runs, so publication must survive request
+// cancellation but still cannot hang forever.
+const grpcPublishTimeout = 30 * time.Second
+
 // errBackendMisconfigured marks failures that happen before any network call:
 // missing backend, an unparseable/undialable backend URL, or a scheme that
 // cannot be dialed for the resolved RPC type. These are operator/config errors,
@@ -262,6 +268,15 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	ctx, cancel := context.WithTimeout(ctx, serviceTimeout)
 	defer cancel()
 
+	// publishCtx detaches the mining + WAL publish from the request lifetime. The
+	// signed response is returned to the client BEFORE ProcessRelay/Publish run, so
+	// publication must survive client cancellation and must not inherit the backend
+	// service timeout (whose budget is already spent). Otherwise an already-served
+	// relay can silently fail to reach the WAL — no session/claim/proof, lost
+	// reward. Mirrors the HTTP path, which publishes via a detached context.
+	publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), grpcPublishTimeout)
+	defer publishCancel()
+
 	// Validate and meter the relay if pipeline is available
 	if s.relayPipeline != nil {
 		// TODO: Get actual compute units from service config
@@ -390,7 +405,7 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 					// publish it — ProcessRelay only builds the message, it does
 					// not publish. Error relays are tracked like the HTTP path's.
 					msg, processErr := s.relayProcessor.ProcessRelay(
-						ctx,
+						publishCtx,
 						reqBz,
 						respBz,
 						supplierOperatorAddr,
@@ -402,7 +417,7 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 							Err(processErr).
 							Msg("failed to process error relay")
 					} else if msg != nil && s.publisher != nil {
-						if pubErr := s.publisher.Publish(ctx, msg); pubErr != nil {
+						if pubErr := s.publisher.Publish(publishCtx, msg); pubErr != nil {
 							logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 								Err(pubErr).
 								Msg("failed to publish error relay")
@@ -461,7 +476,7 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			// the message; without the Publish call the relay never reaches the
 			// miner's WAL and no session/claim/proof is ever created for it.
 			msg, err := s.relayProcessor.ProcessRelay(
-				ctx,
+				publishCtx,
 				reqBz,
 				respBz,
 				supplierOperatorAddr,
@@ -479,7 +494,7 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			} else if s.publisher == nil {
 				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
 					Msg("no publisher configured, skipping relay publication")
-			} else if pubErr := s.publisher.Publish(ctx, msg); pubErr != nil {
+			} else if pubErr := s.publisher.Publish(publishCtx, msg); pubErr != nil {
 				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
 					Err(pubErr).
 					Msg("failed to publish mined relay")
