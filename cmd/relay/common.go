@@ -8,6 +8,7 @@ import (
 	"time"
 
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
+	sdktypes "github.com/pokt-network/shannon-sdk/types"
 
 	"github.com/pokt-network/pocket-relay-miner/client/relay_client"
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -38,19 +39,56 @@ type RelayResult struct {
 	StatusCode   int // HTTP status code (if applicable)
 }
 
-// CheckRelayResponseError checks if a RelayResponse contains an error.
-// This checks the payload for JSON-RPC errors (best-effort).
+// maxErrorBodyBytes bounds how much of a backend error body is echoed into an
+// error message, so a large upstream body cannot bloat CLI/log output.
+const maxErrorBodyBytes = 200
+
+// CheckRelayResponseError checks if a RelayResponse carries a backend or
+// application error.
 //
-// Returns:
-// - error if the response contains a JSON-RPC error
-// - nil if the response is successful or payload is not JSON-RPC
+// A relay's Payload is NOT raw JSON: the relayer wraps the backend's HTTP
+// response in a shannon-sdk POKTHTTPResponse (protobuf) before signing it
+// (see relayer/signer.go, BuildErrorRelayResponse / SerializeHTTPResponse). The
+// previous implementation ran json.Unmarshal directly on that protobuf blob,
+// which always failed silently and left this check dead: a signed HTTP 500
+// error response was reported as a success. We therefore deserialize the
+// POKTHTTPResponse first and inspect the real backend status and body:
+//
+//  1. POKTHTTPResponse decodes (the common case):
+//     a. StatusCode >= 400 -> backend/transport error (the signed error
+//     response the relayer emits when the backend fails).
+//     b. StatusCode < 400  -> apply the JSON-RPC error check to BodyBz (the
+//     actual backend body), not to the protobuf envelope.
+//     c. otherwise -> no error.
+//  2. POKTHTTPResponse does NOT decode -> fall back to a best-effort JSON-RPC
+//     check on the raw payload. This covers payloads that are not wrapped
+//     POKTHTTPResponses (e.g. WebSocket subscription frames).
+//
+// Returns nil when no error is detectable.
 func CheckRelayResponseError(response *servicetypes.RelayResponse) error {
 	if response == nil {
 		return fmt.Errorf("nil relay response")
 	}
 
-	// Try to parse payload as JSON-RPC to check for errors
-	// This is best-effort - not all payloads are JSON-RPC
+	// The relay payload wraps the backend's HTTP response in a protobuf
+	// POKTHTTPResponse. Decode it so the real status and body are inspected,
+	// not the protobuf envelope.
+	if poktResp, err := sdktypes.DeserializeHTTPResponse(response.Payload); err == nil {
+		if poktResp.StatusCode >= 400 {
+			return fmt.Errorf("backend HTTP %d: %s", poktResp.StatusCode, truncateForError(poktResp.BodyBz))
+		}
+		return checkJSONRPCError(poktResp.BodyBz)
+	}
+
+	// Fallback: payload is not a wrapped POKTHTTPResponse (e.g. a WebSocket
+	// subscription frame). Best-effort JSON-RPC check on the raw bytes.
+	return checkJSONRPCError(response.Payload)
+}
+
+// checkJSONRPCError performs a best-effort JSON-RPC error inspection on a body.
+// Not all bodies are JSON-RPC; a parse failure or an absent error field yields
+// nil.
+func checkJSONRPCError(bodyBz []byte) error {
 	var jsonRPCResp struct {
 		Error *struct {
 			Code    int    `json:"code"`
@@ -58,13 +96,22 @@ func CheckRelayResponseError(response *servicetypes.RelayResponse) error {
 		} `json:"error,omitempty"`
 	}
 
-	if err := json.Unmarshal(response.Payload, &jsonRPCResp); err == nil {
+	if err := json.Unmarshal(bodyBz, &jsonRPCResp); err == nil {
 		if jsonRPCResp.Error != nil {
 			return fmt.Errorf("JSON-RPC error %d: %s", jsonRPCResp.Error.Code, jsonRPCResp.Error.Message)
 		}
 	}
 
 	return nil
+}
+
+// truncateForError renders a backend error body for inclusion in an error
+// message, capped at maxErrorBodyBytes.
+func truncateForError(bodyBz []byte) string {
+	if len(bodyBz) > maxErrorBodyBytes {
+		return string(bodyBz[:maxErrorBodyBytes])
+	}
+	return string(bodyBz)
 }
 
 // BuildAndSendRelay is a helper function that builds, sends, and verifies a relay.
