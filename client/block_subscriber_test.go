@@ -357,3 +357,17 @@ func TestConstants(t *testing.T) {
 	require.Equal(t, 15*time.Second, reconnectMaxDelay) // Updated to match actual code
 	require.Equal(t, 2, reconnectBackoffFactor)
 }
+
+// TestNewBlockSubscriber_TrimsTrailingSlash proves a trailing slash on the RPC
+// endpoint is normalized away, so the CometBFT client builds "/websocket" rather
+// than a "//websocket" path that a reverse proxy (e.g. Sauron) rejects with
+// "bad handshake".
+func TestNewBlockSubscriber_TrimsTrailingSlash(t *testing.T) {
+	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
+	for _, in := range []string{"http://localhost:26657/", "http://localhost:26657//", "http://localhost:26657"} {
+		sub, err := NewBlockSubscriber(logger, BlockSubscriberConfig{RPCEndpoint: in})
+		require.NoError(t, err)
+		require.Equal(t, "http://localhost:26657", sub.config.RPCEndpoint, "input %q must normalize", in)
+		sub.Close()
+	}
+}

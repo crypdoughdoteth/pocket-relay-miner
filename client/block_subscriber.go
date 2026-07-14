@@ -6,6 +6,7 @@ import (
 	"fmt"
 	stdhttp "net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,6 +142,13 @@ func NewBlockSubscriber(
 	if config.RPCEndpoint == "" {
 		return nil, fmt.Errorf("RPC endpoint is required")
 	}
+
+	// Normalize a trailing slash: the CometBFT client appends the "/websocket"
+	// endpoint to the remote, so "https://host/" would produce a "//websocket"
+	// path. A reverse proxy in front of the node (e.g. Sauron on beta/mainnet)
+	// rejects the double-slash WS upgrade with "bad handshake". Trimming it makes
+	// "https://host/" and "https://host" behave identically.
+	config.RPCEndpoint = strings.TrimRight(config.RPCEndpoint, "/")
 
 	// Default query timeout if not set
 	if config.QueryTimeout == 0 {
