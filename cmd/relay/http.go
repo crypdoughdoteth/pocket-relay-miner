@@ -39,8 +39,25 @@ var sharedHTTPClient = &http.Client{
 	},
 }
 
+// applyRelayTimeout propagates the --timeout flag onto the shared HTTP client
+// used by the jsonrpc and cometbft modes. The client is constructed with a 30s
+// default; http.Client.Timeout bounds the ENTIRE request and wins over any
+// longer per-request context deadline, so without this the flag (default 120s)
+// was silently ignored and every relay was capped at 30s. A non-positive flag is
+// ignored so an unset value can never disable the client timeout entirely.
+//
+// Call this once at mode entry, before any load-test worker goroutine starts:
+// the shared client is written here and read concurrently afterward.
+func applyRelayTimeout() {
+	if RelayTimeout > 0 {
+		sharedHTTPClient.Timeout = time.Duration(RelayTimeout) * time.Second
+	}
+}
+
 // runHTTPMode sends HTTP/JSONRPC relay requests to the relayer.
 func RunHTTPMode(ctx context.Context, logger logging.Logger, client *relay_client.RelayClient) error {
+	applyRelayTimeout()
+
 	// Build payload (eth_blockNumber by default)
 	payloadBz, err := buildJSONRPCPayload()
 	if err != nil {

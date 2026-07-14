@@ -19,6 +19,8 @@ import (
 // validator's :26657 endpoint). Diagnostic (single-relay) only for now; load
 // testing goes through the jsonrpc mode.
 func RunCometBFTMode(ctx context.Context, logger logging.Logger, client *relay_client.RelayClient) error {
+	applyRelayTimeout()
+
 	payloadBz, err := buildCometBFTPayload()
 	if err != nil {
 		return fmt.Errorf("failed to build payload: %w", err)
