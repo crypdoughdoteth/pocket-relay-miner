@@ -151,12 +151,28 @@ func sendStreamingRelay(ctx context.Context, relayRequestBz []byte) ([][]byte, e
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Read streaming response
-	return readStreamingBatches(resp.Body)
+	// Read streaming response.
+	// -n/--count is the number of SSE batches to collect before closing the
+	// stream. The endpoint is long-lived and never sends EOF under normal
+	// operation, so termination is by batch count, not by the server closing
+	// the connection.
+	return readStreamingBatches(resp.Body, RelayCount)
 }
 
-// readStreamingBatches reads streaming batches from the response body and returns raw bytes.
-func readStreamingBatches(body io.Reader) ([][]byte, error) {
+// readStreamingBatches reads up to maxBatches non-empty batches from the response
+// body and returns their raw bytes. SSE streams are infinite by design, so the
+// scan is bounded by count, not by EOF: collecting maxBatches batches is the
+// success condition and we return immediately, instead of blocking until the
+// server closes the connection (which, on a live stream, only happens when the
+// HTTP client timeout fires).
+//
+// maxBatches is normalized to a floor of 1 so a zero/negative count still yields
+// at least one batch instead of returning empty-handed.
+func readStreamingBatches(body io.Reader, maxBatches int) ([][]byte, error) {
+	if maxBatches < 1 {
+		maxBatches = 1
+	}
+
 	var batches [][]byte
 	scanner := bufio.NewScanner(body)
 
@@ -186,7 +202,9 @@ func readStreamingBatches(body io.Reader) ([][]byte, error) {
 		return 0, nil, nil
 	})
 
-	// Scan batches
+	// Scan until we have collected maxBatches non-empty batches. The stream does
+	// not send EOF under normal operation, so stopping by count is what lets the
+	// diagnostic terminate at all.
 	for scanner.Scan() {
 		batchData := scanner.Bytes()
 		if len(batchData) == 0 {
@@ -198,9 +216,18 @@ func readStreamingBatches(body io.Reader) ([][]byte, error) {
 		batchCopy := make([]byte, len(batchData))
 		copy(batchCopy, batchData)
 		batches = append(batches, batchCopy)
+
+		if len(batches) >= maxBatches {
+			return batches, nil
+		}
 	}
 
-	if err := scanner.Err(); err != nil {
+	// A scanner error after we already have batches is expected when bounding an
+	// infinite stream: the HTTP client timeout fires once the server stops
+	// sending. Those batches are complete and are independently signature-verified
+	// by the caller, so hand them back and swallow the error. Only surface the
+	// error when we collected nothing to return.
+	if err := scanner.Err(); err != nil && len(batches) == 0 {
 		return nil, fmt.Errorf("error reading stream: %w", err)
 	}
 
