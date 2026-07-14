@@ -110,6 +110,48 @@ func runWebSocketDiagnostic(ctx context.Context, logger logging.Logger, relayCli
 	return nil
 }
 
+// wsPoolConn is a pooled WebSocket connection paired with the supplier it was
+// handshaked against. WebSocket pins the supplier at connection time via the
+// Pocket-Supplier-Address header (PATH v2 protocol; the relayer reads it in
+// websocket.go handleWebSocket), so a single connection can only serve relays
+// for that one supplier — the pairing must travel with the conn so workers sign
+// and verify against the right key.
+type wsPoolConn struct {
+	conn     *websocket.Conn
+	supplier string
+}
+
+// assignSuppliersToPool returns the supplier each pooled connection must be
+// handshaked against. Unlike HTTP (where the supplier is chosen per request),
+// WebSocket pins the supplier at the handshake, so round-robin has to happen
+// per CONNECTION here, not per message.
+//
+// The pool is sized to max(concurrency, len(suppliers)) so every supplier gets
+// at least one connection even when there are more suppliers than workers. The
+// connPool is a FIFO channel that workers pop-then-push, so all connections
+// (hence all suppliers) rotate through the active workers over the run even
+// though only `concurrency` are ever in flight at once — a pool larger than
+// concurrency still spreads relays across every supplier.
+//
+// Suppliers are assigned round-robin (suppliers[i%len(suppliers)]). Returns nil
+// when suppliers is empty; the caller validates non-emptiness before use.
+func assignSuppliersToPool(suppliers []string, concurrency int) []string {
+	if len(suppliers) == 0 {
+		return nil
+	}
+
+	poolSize := concurrency
+	if len(suppliers) > poolSize {
+		poolSize = len(suppliers)
+	}
+
+	assigned := make([]string, poolSize)
+	for i := range assigned {
+		assigned[i] = suppliers[i%len(suppliers)]
+	}
+	return assigned
+}
+
 // runWebSocketLoadTest sends concurrent WebSocket relay requests with performance metrics.
 // Uses a connection pool to avoid overhead of creating new connections for each request.
 //
@@ -118,27 +160,46 @@ func runWebSocketDiagnostic(ctx context.Context, logger logging.Logger, relayCli
 // behavior (one sign per incoming request) and guarantees distinct relay bytes
 // per call, so the SMST stores one leaf per request instead of collapsing.
 func runWebSocketLoadTest(ctx context.Context, logger logging.Logger, relayClient *relay_client.RelayClient, payloadBz []byte) error {
-	// Create connection pool as a buffered channel (thread-safe queue)
-	// Workers will pop a connection, use it exclusively, then push it back
-	connPool := make(chan *websocket.Conn, RelayConcurrency)
-	for i := 0; i < RelayConcurrency; i++ {
-		conn, err := connectWebSocket(RelayRelayerURL, RelayServiceID, RelaySupplierAddr)
+	// Supplier targeting: fixed (--supplier / localnet default) or, with
+	// --all-suppliers, round-robin across every supplier in the current
+	// session. A single fixed supplier exhausts ITS per-session claimable
+	// budget quickly while the other session suppliers sit idle; spreading
+	// matches how a gateway distributes traffic.
+	suppliers := []string{RelaySupplierAddr}
+	if RelayAllSuppliers {
+		var supErr error
+		suppliers, supErr = relayClient.SessionSupplierAddresses(ctx, RelayServiceID)
+		if supErr != nil {
+			return fmt.Errorf("failed to list session suppliers: %w", supErr)
+		}
+		logger.Info().Int("suppliers", len(suppliers)).Msg("round-robining across session suppliers")
+	}
+
+	// WebSocket pins the supplier at the handshake, so round-robin is per
+	// connection: one pooled connection per assigned supplier slot.
+	poolSuppliers := assignSuppliersToPool(suppliers, RelayConcurrency)
+
+	// Create connection pool as a buffered channel (thread-safe queue).
+	// Workers will pop a connection, use it exclusively, then push it back.
+	connPool := make(chan wsPoolConn, len(poolSuppliers))
+	for i := range poolSuppliers {
+		conn, err := connectWebSocket(RelayRelayerURL, RelayServiceID, poolSuppliers[i])
 		if err != nil {
 			// Close any connections we already opened
 			close(connPool)
-			for c := range connPool {
-				_ = c.Close()
+			for pc := range connPool {
+				_ = pc.conn.Close()
 			}
 			return fmt.Errorf("failed to create connection pool: %w", err)
 		}
 		// Set ping/pong handlers to keep connections alive
 		conn.SetPongHandler(func(string) error { return nil })
-		connPool <- conn // Push to queue
+		connPool <- wsPoolConn{conn: conn, supplier: poolSuppliers[i]} // Push to queue
 	}
 	defer func() {
 		close(connPool)
-		for conn := range connPool {
-			_ = conn.Close()
+		for pc := range connPool {
+			_ = pc.conn.Close()
 		}
 	}()
 
@@ -158,7 +219,7 @@ func runWebSocketLoadTest(ctx context.Context, logger logging.Logger, relayClien
 	logger.Info().
 		Int("count", RelayCount).
 		Int("concurrency", RelayConcurrency).
-		Int("connection_pool_size", RelayConcurrency).
+		Int("connection_pool_size", len(poolSuppliers)).
 		Int("rps", RelayRPS).
 		Msg("starting WebSocket load test with connection pool")
 
@@ -176,9 +237,11 @@ func runWebSocketLoadTest(ctx context.Context, logger logging.Logger, relayClien
 			defer wg.Done()
 			defer func() { <-semaphore }() // Release slot
 
-			// Pop a connection from the pool (blocking until one is available)
-			conn := <-connPool
-			defer func() { connPool <- conn }() // Push back when done
+			// Pop a connection from the pool (blocking until one is available).
+			// The connection is pinned to a supplier at its handshake, so this
+			// worker signs and verifies against that same supplier.
+			pc := <-connPool
+			defer func() { connPool <- pc }() // Push back when done
 
 			// Send relay with timeout
 			requestCtx, cancel := context.WithTimeout(ctx, time.Duration(RelayTimeout)*time.Second)
@@ -187,7 +250,7 @@ func runWebSocketLoadTest(ctx context.Context, logger logging.Logger, relayClien
 			// Build a FRESH relay request for this worker. Ring signatures use
 			// randomness, so each call yields distinct bytes even for an
 			// identical payload — matches PATH's per-request sign behaviour.
-			_, relayRequestBz, err := relayClient.BuildRelayRequest(requestCtx, RelayServiceID, RelaySupplierAddr, payloadBz)
+			_, relayRequestBz, err := relayClient.BuildRelayRequest(requestCtx, RelayServiceID, pc.supplier, payloadBz)
 			if err != nil {
 				metrics.RecordError(fmt.Errorf("build relay request: %w", err))
 				logger.Debug().
@@ -198,7 +261,7 @@ func runWebSocketLoadTest(ctx context.Context, logger logging.Logger, relayClien
 			}
 
 			start := time.Now()
-			relayResponseBz, err := sendWebSocketRelayOnConnection(requestCtx, conn, relayRequestBz)
+			relayResponseBz, err := sendWebSocketRelayOnConnection(requestCtx, pc.conn, relayRequestBz)
 			latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
 
 			if err != nil {
@@ -210,8 +273,9 @@ func runWebSocketLoadTest(ctx context.Context, logger logging.Logger, relayClien
 				return
 			}
 
-			// Verify relay response signature
-			relayResponse, err := relayClient.VerifyRelayResponse(requestCtx, RelaySupplierAddr, relayResponseBz)
+			// Verify relay response signature against the supplier this
+			// connection was handshaked with (round-robin aware).
+			relayResponse, err := relayClient.VerifyRelayResponse(requestCtx, pc.supplier, relayResponseBz)
 			if err != nil {
 				metrics.RecordError(fmt.Errorf("signature verification failed: %w", err))
 				logger.Debug().
