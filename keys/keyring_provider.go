@@ -182,6 +182,14 @@ func (p *KeyringProvider) LoadKeys(ctx context.Context) (map[string]cryptotypes.
 	return keys, nil
 }
 
+// LoadKeyByName loads a single key from the keyring by its name and returns the
+// private key and its operator address. It is the by-name counterpart to
+// LoadKeys, used by tools (e.g. the relay CLI) that resolve one specific key
+// rather than the whole keyring.
+func (p *KeyringProvider) LoadKeyByName(name string) (cryptotypes.PrivKey, string, error) {
+	return p.loadKeyByName(name)
+}
+
 // loadKeyByName loads a single key by name and returns the private key and address.
 func (p *KeyringProvider) loadKeyByName(name string) (cryptotypes.PrivKey, string, error) {
 	// Get the key record
