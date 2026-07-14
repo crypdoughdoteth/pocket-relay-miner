@@ -386,8 +386,10 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			if marshalErr == nil {
 				respBz, marshalErr := relayResponse.Marshal()
 				if marshalErr == nil {
-					// Process error relay (still subject to difficulty check)
-					_, processErr := s.relayProcessor.ProcessRelay(
+					// Process error relay (still subject to difficulty check) and
+					// publish it — ProcessRelay only builds the message, it does
+					// not publish. Error relays are tracked like the HTTP path's.
+					msg, processErr := s.relayProcessor.ProcessRelay(
 						ctx,
 						reqBz,
 						respBz,
@@ -399,6 +401,12 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 						logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 							Err(processErr).
 							Msg("failed to process error relay")
+					} else if msg != nil && s.publisher != nil {
+						if pubErr := s.publisher.Publish(ctx, msg); pubErr != nil {
+							logging.WithSessionContext(s.logger.Debug(), sessionCtx).
+								Err(pubErr).
+								Msg("failed to publish error relay")
+						}
 					}
 				}
 			}
@@ -448,7 +456,10 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 		} else {
 			respBz := relayResponseBz // Already marshaled above
 
-			// Process relay (includes difficulty check, cache warming, deduplication, publishing)
+			// Process relay (difficulty check, dedup, message construction) and
+			// hand the mined message to the publisher — ProcessRelay only BUILDS
+			// the message; without the Publish call the relay never reaches the
+			// miner's WAL and no session/claim/proof is ever created for it.
 			msg, err := s.relayProcessor.ProcessRelay(
 				ctx,
 				reqBz,
@@ -465,6 +476,13 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				// Relay didn't meet mining difficulty
 				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 					Msg("gRPC relay skipped (did not meet mining difficulty)")
+			} else if s.publisher == nil {
+				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+					Msg("no publisher configured, skipping relay publication")
+			} else if pubErr := s.publisher.Publish(ctx, msg); pubErr != nil {
+				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+					Err(pubErr).
+					Msg("failed to publish mined relay")
 			} else {
 				// Relay was successfully processed and published
 				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
