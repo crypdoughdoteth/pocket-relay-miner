@@ -305,12 +305,19 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--rps requires --load-test flag (RPS targeting only works in load test mode)")
 	}
 
+	// Streams are long-lived by design: load test mode does not apply, and
+	// -n/--count means "SSE batches to collect in one stream", not relays.
+	// Fail here, before query clients and keys are initialized.
+	if mode == "stream" && relay.RelayLoadTest {
+		return fmt.Errorf("load test mode is not supported for streaming relays (use -n to bound how many batches to collect)")
+	}
+
 	// Warn if load test flags are used without --load-test
 	if !relay.RelayLoadTest {
 		if relay.RelayConcurrency > 1 && cmd.Flags().Changed("concurrency") {
 			return fmt.Errorf("--concurrency requires --load-test flag (diagnostic mode only supports single requests)")
 		}
-		if relay.RelayCount > 1 {
+		if relay.RelayCount > 1 && mode != "stream" {
 			return fmt.Errorf("-n/--count > 1 requires --load-test flag (diagnostic mode sends exactly 1 relay, use --load-test for multiple requests)")
 		}
 	}
