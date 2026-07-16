@@ -148,6 +148,53 @@ A successful simulated relay returns a **supplier-signed** response containing
 the real backend result — the same response shape a paying gateway would
 receive.
 
+Each transport uses the app key of its service, so the pinned identity's
+`key_id` must match that service. On localnet (`tilt up`) one identity per
+`develop-*` service is pre-pinned:
+
+| Mode | Service | `--sim-key-id` |
+|---|---|---|
+| `jsonrpc` | `develop-http` | `sim-http` |
+| `websocket` | `develop-websocket` | `sim-ws` |
+| `stream` | `develop-stream` | `sim-stream` |
+| `grpc` | `develop-grpc` | `sim-grpc` |
+| `cometbft` | `develop-cometbft` | `sim-cometbft` |
+
+Localnet examples (relayer direct on `:8180`, supplier1 loaded):
+
+```bash
+SUP=pokt19a3t4yunp0dlpfjrp7qwnzwlrzd5fzs2gjaaaj
+
+pocket-relay-miner relay jsonrpc   --localnet --service develop-http      --supplier $SUP --simulate --sim-key-id sim-http
+pocket-relay-miner relay cometbft  --localnet --service develop-cometbft  --supplier $SUP --simulate --sim-key-id sim-cometbft
+pocket-relay-miner relay grpc      --localnet --service develop-grpc      --supplier $SUP --simulate --sim-key-id sim-grpc
+pocket-relay-miner relay websocket --localnet --service develop-websocket --supplier $SUP --simulate --sim-key-id sim-ws
+
+# Streaming (SSE): a stream is one relay whose data is delivered in batches.
+# Each batch is supplier-signed; the whole stream is a single relay. Use
+# --batches N so the demo backend closes the stream after N events instead of
+# streaming forever (a real streaming backend closes on its own).
+pocket-relay-miner relay stream    --localnet --service develop-stream    --supplier $SUP --simulate --sim-key-id sim-stream --batches 3
+```
+
+### Verifying it never charges
+
+A simulated relay must produce **no** mining state. To confirm, fire a burst of
+simulated relays and check that no claim/session/WAL state was created — only
+the simulated metric moves:
+
+```bash
+# Fire a burst of simulated relays (above), then inspect Redis:
+redis-cli --scan --pattern 'ha:miner:sessions:*' | wc -l   # unchanged by simulation
+redis-cli --scan --pattern 'ha:smst:*'           | wc -l   # unchanged by simulation
+redis-cli --scan --pattern '*simv1*'             | wc -l   # 0 — a synthetic sim session never persists
+redis-cli XLEN ha:relays:<supplier>                        # WAL not grown by simulation
+```
+
+A claim is built from an SMST tree; a simulated relay creates no SMST tree, so
+it is **structurally impossible** for simulated traffic to produce a claim or a
+proof — not merely suppressed.
+
 ### Metrics
 
 Simulated relays increment only their own metric and never the real-relay
