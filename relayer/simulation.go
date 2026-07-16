@@ -406,7 +406,13 @@ func (v *SimulationVerifier) Verify(ctx context.Context, keyID string, rr *servi
 func (v *SimulationVerifier) checkReplay(ctx context.Context, signature []byte) error {
 	sum := sha256.Sum256(signature)
 	key := v.redis.KB().SimulationReplayKey(hex.EncodeToString(sum[:]))
-	ttl := time.Duration(v.windowSecs) * time.Second
+	// TTL covers the FULL freshness lifetime, not just one window. The freshness
+	// check is two-sided (|now - ts| < window), so a future-dated request (a
+	// client clock ahead by up to `window`) stays fresh until ts + window =
+	// now + 2*window from first-seen. A window-length TTL would expire the dedup
+	// entry while the request is still admissible, reopening a replay gap under
+	// clock skew. 2*window closes it.
+	ttl := 2 * time.Duration(v.windowSecs) * time.Second
 	set, err := v.redis.SetNX(ctx, key, "1", ttl).Result()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrSimDedupUnavailable, err)
