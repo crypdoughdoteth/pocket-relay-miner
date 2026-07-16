@@ -9,6 +9,7 @@ Production-grade, horizontally scalable relay mining service for Pocket Network.
 - **High Availability**: Redis-backed shared state with automatic leader election
 - **Relay Validation**: Ring signature verification, session validation, supplier signing
 - **Relay Metering**: Rate limiting based on application stake
+- **Simulated Relays**: Exercise a live relayer end-to-end — real signature, real backend — without minting a claimable relay ([guide](docs/simulated-relays.md))
 - **Observability**: Prometheus metrics, pprof profiling, structured logging
 
 ## Architecture
@@ -136,6 +137,38 @@ Full testing guides — Tilt bring-up, PATH+`hey` load, and direct-CLI testing o
 all four transports (JSON-RPC, WebSocket, gRPC, streaming) — are in
 [`docs/testing/`](docs/testing/README.md).
 
+### Simulated Relays
+
+A simulated relay is signed with a **real ring signature** and served by the
+**real backend**, but it is verified against a ring pinned in the relayer's
+config instead of one read from chain — so it needs no staked application and no
+chain access. It is never metered and never published, so it never becomes part
+of a claim and is never paid for. Use it to exercise a live relayer end to end.
+
+```bash
+pocket-relay-miner relay jsonrpc --localnet --service develop-http \
+  --supplier <addr> --simulate --sim-key-id sim-http
+```
+
+See [`docs/simulated-relays.md`](docs/simulated-relays.md) for configuration, the
+per-transport key IDs, and how to verify that nothing was charged.
+
+### Signing a Relay from Another Language
+
+Relays are signed with a **bLSAG ring signature**, not a plain secp256k1
+signature. [`examples/relay-signing/`](examples/relay-signing/README.md) documents
+the scheme byte-for-byte and ships working signers in **Node.js**, **Python** and
+**Rust**, plus a Go **oracle** that verifies your own implementation against the
+same `ring-go` the relayer runs.
+
+The ring is `[application, gateway]`, but it is built from **public** keys and
+signed by **one** private key — the signer's, normally the gateway's. That is
+what delegation means: a gateway signs for an application without ever holding
+its key. The keys themselves are plain secp256k1 scalars, 32 bytes of hex.
+
+Signing a real relay and a simulated one is the same act — so these examples use
+the simulated path to prove a signer works without staking anything.
+
 ### Debugging Redis State
 
 ```bash
@@ -173,9 +206,12 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development workflow and guidelines
 ## Documentation
 
 - [`docs/testing/`](docs/testing/README.md) - Testing guides (Tilt bring-up, PATH+hey load, direct-CLI per-protocol)
+- [`docs/simulated-relays.md`](docs/simulated-relays.md) - Simulated relays: what they are, how to enable and fire them, and how to verify nothing was charged
+- [`examples/relay-signing/`](examples/relay-signing/README.md) - Signing a relay in Node.js, Python or Rust: the ring-signature scheme byte-for-byte, working signers, and an oracle to verify your own
 - [`docs/PROTOCOL_SPEC.md`](docs/PROTOCOL_SPEC.md) - Relay protocol specification
 - [`docs/REDIS.md`](docs/REDIS.md) - Redis architecture and key patterns
 - [`docs/CLAIM_PROOF_LIFECYCLE.md`](docs/CLAIM_PROOF_LIFECYCLE.md) - Claim/proof windows and inclusion reconciler
+- [`docs/CLAIM_LEAF_MODEL.md`](docs/CLAIM_LEAF_MODEL.md) - How relays become claim leaves and what a claim commits to
 - [`docs/WEBSOCKET_HANDSHAKE_PROTOCOL.md`](docs/WEBSOCKET_HANDSHAKE_PROTOCOL.md) - WebSocket protocol details
 - [`CLAUDE.md`](CLAUDE.md) - Technical reference for contributors
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) - Contribution guidelines

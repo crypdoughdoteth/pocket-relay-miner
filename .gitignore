@@ -37,3 +37,21 @@ scripts/localonly/
 
 # GSD Planning
 .planning
+
+# Example signers: build output and installed dependencies. The examples are
+# source to read and copy; everything a toolchain generates from them stays out.
+examples/**/node_modules/
+examples/**/target/
+examples/**/__pycache__/
+examples/**/.ruff_cache/
+examples/**/.venv/
+# A compiled oracle, wherever a reader builds one. Note this must not swallow
+# examples/relay-signing/oracle/, which is the oracle's SOURCE and is tracked —
+# hence the per-language paths rather than a bare `oracle`.
+examples/**/oracle-bin
+examples/relay-signing/nodejs/oracle
+examples/relay-signing/python/oracle
+examples/relay-signing/rust/oracle
+# `go build ./examples/relay-signing/oracle` from the repo root drops a 5 MB
+# binary here. Root-anchored, so it cannot swallow the source dir above.
+/oracle
