@@ -78,6 +78,36 @@ var (
 		[]string{"service_id", "application", "reason"},
 	)
 
+	// simulatedRelaysTotal counts SIMULATED relays only. It is deliberately
+	// separate from every real-relay counter above: a simulated relay never
+	// increments relaysReceived/relaysServed/relaysRejected/etc. `key_id` is
+	// intentionally NOT a label (operator-chosen, potentially unbounded).
+	// result ∈ {success, rate_limited, verify_failed, replay_rejected,
+	// identity_mismatch, service_unknown, supplier_not_loaded, sign_failed,
+	// backend_error, meter_degraded}.
+	simulatedRelaysTotal = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "simulated_relays_total",
+			Help:      "Total simulated relays (health-check/probe traffic), isolated from real-relay counters",
+		},
+		[]string{"transport", "service", "supplier", "result"},
+	)
+
+	// simulatedRelayDuration is the end-to-end latency of simulated relays,
+	// kept separate from relayLatency so probe traffic never skews real p99s.
+	simulatedRelayDuration = observability.RelayerFactory.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "simulated_relay_duration_seconds",
+			Help:      "End-to-end latency of simulated relays",
+			Buckets:   observability.FineGrainedLatencyBuckets,
+		},
+		[]string{"transport", "service"},
+	)
+
 	// === CRITICAL HISTOGRAMS (async recorded to avoid hot path blocking) ===
 	// Only 4 histograms to minimize lock contention - recorded via MetricRecorder worker
 
