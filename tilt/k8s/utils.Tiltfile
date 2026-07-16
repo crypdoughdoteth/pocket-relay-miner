@@ -120,6 +120,34 @@ def apply_k8s_overrides_relayer(config, redis_host):
                     if "url" in backends["jsonrpc"]:
                         backends["jsonrpc"].pop("url")
 
+    # Localnet-only: enable simulated relays with the well-known dev app+gateway
+    # keypairs pinned (one identity per service, since each service uses its own
+    # app key). These are PUBLIC localnet dev keys — NEVER enable simulation with
+    # them on a real deployment.
+    _gw1 = "025821a2ac597a034250ac14b772efccf9297aa7c4bea5444564059a7cfb152063"
+    config["simulation"] = {
+        "enabled": True,
+        "max_concurrent": 32,
+        "freshness_window_seconds": 60,
+        "identities": [
+            {"key_id": "sim-http", "enabled": True, "max_rps": 100,
+             "app_pubkey_hex": "0397896e9b106df70124a856861cc9be52fac9980e2c7a118a36c19d0198692cc5",
+             "gateway_pubkeys_hex": [_gw1], "allowed_services": ["develop-http"]},
+            {"key_id": "sim-ws", "enabled": True, "max_rps": 100,
+             "app_pubkey_hex": "02ff92de294bea65988bf929d7c159be03f69c4d74dc75682c78751102febf2d8e",
+             "gateway_pubkeys_hex": [_gw1], "allowed_services": ["develop-websocket"]},
+            {"key_id": "sim-stream", "enabled": True, "max_rps": 100,
+             "app_pubkey_hex": "0393251466c074a111fd2f6d19ca7fc956ecca512a6d4ae7a0ad6080fd1560926c",
+             "gateway_pubkeys_hex": [_gw1], "allowed_services": ["develop-stream"]},
+            {"key_id": "sim-grpc", "enabled": True, "max_rps": 100,
+             "app_pubkey_hex": "020499e5ebe4945576ee20a9f0524ddcd6ca7c1bcea726a6cbb2d68cbc25d369a6",
+             "gateway_pubkeys_hex": [_gw1], "allowed_services": ["develop-grpc"]},
+            {"key_id": "sim-cometbft", "enabled": True, "max_rps": 100,
+             "app_pubkey_hex": "0204e2c883e67ff768b9b4261ecb2ab08130ab09c41ca0f7b176f750d90092aa6a",
+             "gateway_pubkeys_hex": [_gw1], "allowed_services": ["develop-cometbft"]},
+        ],
+    }
+
     return config
 
 def dict_get(d, key, default=None):
