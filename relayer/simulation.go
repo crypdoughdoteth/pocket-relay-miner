@@ -41,6 +41,44 @@ var (
 	ErrSimBadSignature      = errors.New("simulation: ring signature verification failed")
 )
 
+// Simulated-relay metric result labels (bounded). Shared across transports so
+// every wiring site reports the same values.
+const (
+	SimResultSuccess           = "success"
+	SimResultRateLimited       = "rate_limited"
+	SimResultVerifyFailed      = "verify_failed"
+	SimResultReplayRejected    = "replay_rejected"
+	SimResultIdentityMismatch  = "identity_mismatch"
+	SimResultServiceUnknown    = "service_unknown"
+	SimResultServiceNotAllowed = "service_not_allowed"
+	SimResultSupplierNotLoaded = "supplier_not_loaded"
+	SimResultSignFailed        = "sign_failed"
+	SimResultBackendError      = "backend_error"
+	SimResultMeterDegraded     = "meter_degraded"
+	SimResultDedupUnavailable  = "dedup_unavailable"
+)
+
+// SimResultForError maps an admission error to its bounded metric result label.
+func SimResultForError(err error) string {
+	switch {
+	case errors.Is(err, ErrSimReplay):
+		return SimResultReplayRejected
+	case errors.Is(err, ErrSimIdentityMismatch):
+		return SimResultIdentityMismatch
+	case errors.Is(err, ErrSimServiceUnknown):
+		return SimResultServiceUnknown
+	case errors.Is(err, ErrSimServiceNotAllowed):
+		return SimResultServiceNotAllowed
+	case errors.Is(err, ErrSimSupplierNotLoaded), errors.Is(err, ErrSimSupplierMissing):
+		return SimResultSupplierNotLoaded
+	case errors.Is(err, ErrSimDedupUnavailable):
+		return SimResultDedupUnavailable
+	default:
+		// unknown key_id, disabled, expired, stale, bad session id, bad signature
+		return SimResultVerifyFailed
+	}
+}
+
 // simSessionIDPrefix tags the synthetic session id format used ONLY by
 // simulated relays: "simv1:<unixSeconds>:<hexNonce>". The timestamp lives
 // inside the ring-signed session id (so it is tamper-proof), letting the

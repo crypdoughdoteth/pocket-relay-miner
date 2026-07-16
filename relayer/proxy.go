@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -144,6 +145,10 @@ type ProxyServer struct {
 	responseSigner *ResponseSigner
 	supplierCache  *cache.SupplierCache
 	relayMeter     *RelayMeter
+
+	// simVerifier owns the simulated-relay Admission zone. When nil or disabled,
+	// the simulation header is ignored and every relay takes the normal path.
+	simVerifier *SimulationVerifier
 
 	// HTTP client pool for backend requests.
 	// Key: service ID. Value: *http.Client configured with that service's
@@ -807,6 +812,19 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			Msg("missing supplier operator address in relay request")
 		p.sendError(w, http.StatusBadRequest, "missing supplier operator address in relay request")
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonMissingSupplierAddress).Inc()
+		return
+	}
+
+	// SIMULATION SEAM — the only simulation-aware line on the normal path.
+	// A simulated relay is admitted eagerly HERE (before the on-chain supplier
+	// registry decision, the ValidationMode split, metering, and publishing)
+	// because its Admission — pinned-ring verify + rate limit + freshness — is
+	// its only authorization and MUST precede the backend. When simulation is
+	// disabled the header is ignored (R7) and the normal path continues. The
+	// shared data-path primitives (forwardToBackendWithStreaming, the response
+	// signer) are reused inside serveSimulatedHTTP.
+	if directive := SimDirectiveFromHTTP(r.Header); directive.KeyID != "" && p.simVerifier != nil && p.simVerifier.Enabled() {
+		p.serveSimulatedHTTP(w, r, body, relayRequest, serviceID, &svcConfig, rpcType, poktHTTPRequest, directive.KeyID, startTime)
 		return
 	}
 
@@ -2113,6 +2131,138 @@ func (p *ProxyServer) SetSupplierCache(cache *cache.SupplierCache) {
 // SetRelayMeter sets the relay meter for rate limiting based on app stakes.
 func (p *ProxyServer) SetRelayMeter(meter *RelayMeter) {
 	p.relayMeter = meter
+}
+
+// SetSimulationVerifier wires the simulated-relay admission component. Optional:
+// when nil or disabled, simulation headers are ignored and all relays take the
+// normal path.
+func (p *ProxyServer) SetSimulationVerifier(v *SimulationVerifier) {
+	p.simVerifier = v
+}
+
+// simHTTPStatus maps a simulation admission error to an HTTP status. The result
+// metric label comes from SimResultForError (transport-agnostic).
+func simHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrSimReplay):
+		return http.StatusConflict
+	case errors.Is(err, ErrSimServiceUnknown):
+		return http.StatusNotFound
+	case errors.Is(err, ErrSimSupplierMissing), errors.Is(err, ErrSimBadSessionID):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrSimDedupUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusForbidden
+	}
+}
+
+// serveSimulatedHTTP serves a simulated relay over HTTP (jsonrpc/cometbft). It
+// runs the simulation Admission zone (global slot → pinned-ring/binding/
+// freshness Verify → per-key rate), then the SHARED data path — the SAME
+// forwardToBackendWithStreaming and response signer the real path uses — with
+// Accounting (meter consume + publish) skipped entirely. It never publishes,
+// never consumes stake, and touches only the simulated-relay metrics.
+//
+// It is always eager-admission: Admission is a simulated relay's only
+// authorization, so it must precede the backend regardless of the service's
+// ValidationMode (default optimistic). A single backend attempt (no retry
+// wrapper) is used deliberately — a health check wants the true first-attempt
+// result.
+func (p *ProxyServer) serveSimulatedHTTP(
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	relayRequest *servicetypes.RelayRequest,
+	serviceID string,
+	svcConfig *ServiceConfig,
+	rpcType string,
+	poktHTTPRequest *sdktypes.POKTHTTPRequest,
+	keyID string,
+	startTime time.Time,
+) {
+	supplier := relayRequest.Meta.SupplierOperatorAddress
+	transportLabel := rpcType
+
+	recordResult := func(result string) {
+		simulatedRelaysTotal.WithLabelValues(transportLabel, serviceID, supplier, result).Inc()
+	}
+
+	// R2 — global concurrency slot before any expensive work.
+	release, ok := p.simVerifier.AcquireGlobal()
+	if !ok {
+		recordResult(SimResultRateLimited)
+		p.sendError(w, http.StatusTooManyRequests, "simulation concurrency limit reached")
+		return
+	}
+	defer release()
+
+	// Admission — pinned-ring signature, identity binding, freshness, replay.
+	if err := p.simVerifier.Verify(r.Context(), keyID, relayRequest); err != nil {
+		recordResult(SimResultForError(err))
+		p.sendError(w, simHTTPStatus(err), fmt.Sprintf("simulation rejected: %v", err))
+		return
+	}
+
+	// R2 — per-key rate cap charged only AFTER a request verifies (so a public
+	// key_id cannot be used pre-auth to starve the legit health check).
+	if !p.simVerifier.AllowKey(keyID) {
+		recordResult(SimResultRateLimited)
+		p.sendError(w, http.StatusTooManyRequests, "simulation rate limit reached")
+		return
+	}
+
+	// SHARED DATA PATH — same backend-forward primitive as the real path.
+	respBody, respHeaders, respStatus, isStreaming, _, _, err := p.forwardToBackendWithStreaming(
+		r.Context(), r, body, serviceID, svcConfig, rpcType, poktHTTPRequest, w, relayRequest, nil, nil,
+	)
+	if err != nil {
+		recordResult(SimResultBackendError)
+		if !isStreaming {
+			p.sendError(w, http.StatusBadGateway, "backend error")
+		}
+		return
+	}
+	if isStreaming {
+		// The helper already batch-signed and wrote the stream to w.
+		recordResult(SimResultSuccess)
+		p.metricRecorder.RecordDuration(simulatedRelayDuration, []string{transportLabel, serviceID}, time.Since(startTime))
+		return
+	}
+	if respStatus >= http.StatusInternalServerError {
+		// Match the real path: raw 5xx, not wrapped/signed.
+		recordResult(SimResultBackendError)
+		p.sendError(w, respStatus, "backend service error")
+		return
+	}
+
+	// SHARED DATA PATH — same response signer as the real path.
+	_, signedResponseBz, signErr := p.responseSigner.BuildAndSignRelayResponseFromBody(
+		relayRequest, respBody, respHeaders, respStatus,
+	)
+	if signErr != nil {
+		recordResult(SimResultSignFailed)
+		p.sendError(w, http.StatusInternalServerError, "failed to sign response")
+		return
+	}
+
+	// ACCOUNTING gated off: no meter consume, no publish. A dry, non-mutating
+	// meter probe feeds the result label so a health check can see meter health.
+	result := SimResultSuccess
+	if p.relayMeter != nil {
+		if healthErr := p.relayMeter.CheckRelayHealth(r.Context(), serviceID); healthErr != nil {
+			result = SimResultMeterDegraded
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, werr := w.Write(signedResponseBz); werr != nil {
+		p.logger.Debug().Err(werr).Msg("failed to write simulated response body")
+	}
+
+	recordResult(result)
+	p.metricRecorder.RecordDuration(simulatedRelayDuration, []string{transportLabel, serviceID}, time.Since(startTime))
 }
 
 // InitializeRelayPipeline initializes the unified relay processing pipeline.

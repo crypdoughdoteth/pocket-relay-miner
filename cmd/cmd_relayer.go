@@ -516,6 +516,29 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 				return fmt.Errorf("failed to create response signer: %w", signerErr)
 			}
 			proxy.SetResponseSigner(responseSigner)
+
+			// Wire the simulated-relay verifier (Admission zone). Optional and
+			// off by default; when disabled the header is ignored. Needs the
+			// response signer (to sign simulated responses) and the set of
+			// configured service IDs (to bind a simulated relay to a real,
+			// routable service).
+			simServiceIDs := make(map[string]struct{}, len(config.Services))
+			for svcID := range config.Services {
+				simServiceIDs[svcID] = struct{}{}
+			}
+			simVerifier, simErr := relayer.NewSimulationVerifier(
+				logger, &config.Simulation, redisClient, responseSigner, simServiceIDs, nil,
+			)
+			if simErr != nil {
+				return fmt.Errorf("failed to create simulation verifier: %w", simErr)
+			}
+			proxy.SetSimulationVerifier(simVerifier)
+			if config.Simulation.Enabled {
+				logger.Info().
+					Int("identities", len(config.Simulation.Identities)).
+					Msg("simulated relays ENABLED")
+			}
+
 			logger.Info().
 				Int("num_keys", len(responseSigner.GetOperatorAddresses())).
 				Msg("response signer initialized")
