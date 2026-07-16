@@ -239,8 +239,10 @@ It ships two secp256k1 backends and they disagree:
 
 Land in the wrong file and you will "prove" the quirk does not exist. It is a
 coin flip which one you open. The two backends are therefore **wire-incompatible
-for ~1 challenge in 256**: building this project with `-tags ethereum_secp256k1`
-silently forks signature validity, and that tag currently compiles.
+for ~1 challenge in 256**, which would make `-tags ethereum_secp256k1` a silent
+consensus fork. This repository refuses to build with it
+([`rings/ethereum_backend_unsupported.go`](../../rings/ethereum_backend_unsupported.go));
+the scheme is defined by the default backend's behaviour, quirk and all.
 
 Two further consequences of how Go writes it, both easy to get subtly wrong:
 

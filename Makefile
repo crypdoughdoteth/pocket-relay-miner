@@ -99,12 +99,13 @@ lint: ## Run golangci-lint
 	@golangci-lint run
 	@cd $(BACKEND_DIR) && golangci-lint run
 
-install-hooks: ## Install git pre-commit hooks
+install-hooks: ## Install the git pre-commit hook (gofmt, build, vet, lint checks)
 	@echo "Installing git hooks..."
+	@chmod +x scripts/pre-commit-hook.sh
 	@ln -sf ../../scripts/pre-commit-hook.sh .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "Pre-commit hook installed successfully"
-	@echo "The hook will run 'make fmt' and 'make lint' before each commit"
+	@echo "Pre-commit hook installed."
+	@echo "Before each commit it checks: gofmt, go build, go vet, tracked files, golangci-lint."
+	@echo "It reports problems rather than fixing them; bypass once with 'git commit --no-verify'."
 
 docker-build: ## Build Docker image (override with DOCKER_IMAGE env var)
 	@echo "Building Docker image: $(DOCKER_IMAGE)..."
