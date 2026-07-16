@@ -168,6 +168,18 @@ func (kb *KeyBuilder) MeterActiveSessionsKey() string {
 	return fmt.Sprintf("%s:%s:active_sessions", kb.ns.BasePrefix, kb.ns.MeterPrefix)
 }
 
+// SimulationReplayKey builds the shared replay-dedup key for a simulated
+// relay, keyed by the hex-encoded signature hash. A short TTL (the freshness
+// window) is set by the caller so a captured simulated relay cannot be
+// replayed across the HA fleet within the window. Shared (Redis) state is
+// required for correctness: a per-replica cache would let an attacker replay
+// the same request once to each replica.
+// Format: {base}:sim:replay:{sigHash}
+// Example: "ha:sim:replay:deadbeef"
+func (kb *KeyBuilder) SimulationReplayKey(sigHash string) string {
+	return fmt.Sprintf("%s:sim:replay:%s", kb.ns.BasePrefix, sigHash)
+}
+
 // SupplierUpdateChannel builds the pub/sub channel for supplier updates.
 // Format: {base}:{events}:supplier_update
 // Example: "ha:events:supplier_update"

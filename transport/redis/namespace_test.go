@@ -72,6 +72,7 @@ func allKeyBuilderOutputs(kb *KeyBuilder) map[string]string {
 		"SMSTSessionAllPattern":               kb.SMSTSessionAllPattern("sup1", "sess1"),
 		"LegacyParamsKey":                     kb.LegacyParamsKey("shared"),
 		"LegacyParamsPattern":                 kb.LegacyParamsPattern(),
+		"SimulationReplayKey":                 kb.SimulationReplayKey("deadbeef"),
 	}
 }
 
@@ -151,6 +152,7 @@ func TestKeyBuilder_DefaultGoldenStrings(t *testing.T) {
 		"SMSTSessionAllPattern":               "ha:smst:sup1:sess1:*",
 		"LegacyParamsKey":                     "ha:params:shared",
 		"LegacyParamsPattern":                 "ha:params:*",
+		"SimulationReplayKey":                 "ha:sim:replay:deadbeef",
 
 		// Methods the original golden map omitted (review finding): the SMST
 		// family, service factor, and miner coordination keys.
