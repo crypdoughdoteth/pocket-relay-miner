@@ -169,6 +169,17 @@ type WebSocketBridge struct {
 	arrivalHeight   int64
 	computeUnits    uint64 // Compute units for this service
 
+	// Simulation (optional). When simulated is true, every gateway message on
+	// this connection goes through simVerifier's Admission zone instead of
+	// relayPipeline.ValidateRelay/MeterRelay -- a simulated relay must never
+	// consume stake. simKeyID is the pinned identity bound to this connection
+	// for its whole lifetime (set once at the handshake). The forward-to-
+	// backend, response-signing, and emit steps are the SHARED data path and
+	// run unchanged for both simulated and real connections.
+	simulated   bool
+	simVerifier *SimulationVerifier
+	simKeyID    string
+
 	// Relay counting for billing
 	relayCount atomic.Uint64
 
@@ -196,6 +207,12 @@ var WebSocketUpgrader = websocket.Upgrader{
 
 // NewWebSocketBridge creates a new WebSocket bridge.
 // The dialTimeout is derived from the service's timeout profile.
+//
+// simulated, simVerifier, and simKeyID wire the simulated-relay Admission
+// zone (mirrors the HTTP/gRPC serveSimulated* pattern). When simulated is
+// true, the caller (WebSocketHandler) MUST also have passed a nil publisher
+// -- the Accounting skip for a simulated connection. When simulated is
+// false, simVerifier/simKeyID are unused.
 func NewWebSocketBridge(
 	logger logging.Logger,
 	gatewayConn *websocket.Conn,
@@ -211,6 +228,9 @@ func NewWebSocketBridge(
 	relayPipeline *RelayPipeline,
 	computeUnits uint64,
 	dialTimeout time.Duration,
+	simulated bool,
+	simVerifier *SimulationVerifier,
+	simKeyID string,
 ) (*WebSocketBridge, error) {
 	// A nil relayProcessor used to drop us into a "fallback" emit path that
 	// published MinedRelayMessage{RelayHash: nil, CU: 1}, which silently
@@ -243,6 +263,9 @@ func NewWebSocketBridge(
 		supplierAddress:  supplierAddress,
 		arrivalHeight:    arrivalHeight,
 		computeUnits:     computeUnits,
+		simulated:        simulated,
+		simVerifier:      simVerifier,
+		simKeyID:         simKeyID,
 		sessionMonitor:   sessionMonitor,
 		sessionEndHeight: 0, // Will be set from first relay request
 		ctx:              ctx,
@@ -489,8 +512,47 @@ func (b *WebSocketBridge) handleGatewayMessage(msg wsMessage) {
 		}
 	}
 
-	// Validate and meter the relay if pipeline is available
-	if b.relayPipeline != nil {
+	if b.simulated {
+		// SIMULATION ADMISSION — replaces ValidateRelay/MeterRelay entirely for
+		// a simulated message; a simulated relay must NEVER consume stake.
+		// Mirrors the HTTP/gRPC Admission zone: global slot -> pinned-ring/
+		// binding/freshness Verify -> per-key rate. On rejection the bridge
+		// closes the connection, the existing convention on this bridge for a
+		// gateway message that fails admission/validation.
+		supplier := b.supplierAddress
+		if relayReq.Meta.SupplierOperatorAddress != "" {
+			supplier = relayReq.Meta.SupplierOperatorAddress
+		}
+		recordSim := func(result string) {
+			simulatedRelaysTotal.WithLabelValues("websocket", b.serviceID, supplier, result).Inc()
+		}
+
+		release, ok := b.simVerifier.AcquireGlobal()
+		if !ok {
+			recordSim(SimResultRateLimited)
+			b.logger.Warn().Msg("simulation concurrency limit reached - closing connection")
+			_ = b.closeWithReason(CloseTryAgainLater, "simulation concurrency limit reached", wsCloseInitiatorRelayer)
+			return
+		}
+		defer release()
+
+		if err := b.simVerifier.Verify(b.ctx, b.simKeyID, relayReq); err != nil {
+			recordSim(SimResultForError(err))
+			b.logger.Warn().Err(err).Msg("simulated relay admission failed - closing connection")
+			_ = b.closeWithReason(CloseValidationFailed, "simulation rejected", wsCloseInitiatorRelayer)
+			return
+		}
+
+		// R2 — per-key rate cap charged only AFTER a request verifies (so a
+		// public key_id cannot be used pre-auth to starve a legit connection).
+		if !b.simVerifier.AllowKey(b.simKeyID) {
+			recordSim(SimResultRateLimited)
+			b.logger.Warn().Msg("simulation rate limit reached - closing connection")
+			_ = b.closeWithReason(CloseTryAgainLater, "simulation rate limit reached", wsCloseInitiatorRelayer)
+			return
+		}
+	} else if b.relayPipeline != nil {
+		// Validate and meter the relay if pipeline is available
 		// Build relay context for validation/metering
 		relayCtx := &RelayContext{
 			Request:            relayReq,
@@ -647,6 +709,22 @@ func (b *WebSocketBridge) forwardToBackend(msg wsMessage) {
 // emitRelay creates and publishes a mined relay for a request/response pair.
 // This is the billing mechanism - each req/resp pair becomes a relay.
 func (b *WebSocketBridge) emitRelay(req *servicetypes.RelayRequest, resp *servicetypes.RelayResponse, respPayload []byte) {
+	if b.simulated {
+		// ACCOUNTING gated off entirely for a simulated relay: no mining
+		// (relayProcessor.ProcessRelay), no publish -- ever, regardless of
+		// whether a publisher happens to be wired on this bridge. Production
+		// always passes a nil publisher at handshake construction (see
+		// WebSocketHandler) as an additional belt-and-suspenders guard, but
+		// this check does not rely on that: it is what actually prevents the
+		// WAL publish.
+		supplierAddr := b.supplierAddress
+		if req.Meta.SupplierOperatorAddress != "" {
+			supplierAddr = req.Meta.SupplierOperatorAddress
+		}
+		simulatedRelaysTotal.WithLabelValues("websocket", b.serviceID, supplierAddr, SimResultSuccess).Inc()
+		return
+	}
+
 	if b.publisher == nil {
 		return
 	}
@@ -949,6 +1027,17 @@ func (p *ProxyServer) WebSocketHandler() http.HandlerFunc {
 			return
 		}
 
+		// SIMULATION SEAM — the only simulation-aware line on the WebSocket
+		// handshake path. Whether this CONNECTION is simulated is decided once,
+		// here, from the handshake headers (mirrors SimDirectiveFromHTTP/GRPC).
+		// Every subsequent message on this connection is admitted through
+		// simVerifier inside handleGatewayMessage instead of
+		// relayPipeline.ValidateRelay/MeterRelay. When simulation is disabled or
+		// the header is absent, simulated is false and behavior is unchanged
+		// (R7): the header is ignored and the bridge runs the normal path.
+		simDirective := SimDirectiveFromWS(r.Header)
+		simulated := simDirective.KeyID != "" && p.simVerifier != nil && p.simVerifier.Enabled()
+
 		// Validate critical dependencies are configured - fail fast before upgrade
 		if p.responseSigner == nil {
 			p.logger.Error().Str(logging.FieldServiceID, serviceID).Msg("response signer not configured")
@@ -1028,6 +1117,19 @@ func (p *ProxyServer) WebSocketHandler() http.HandlerFunc {
 		// Get dial timeout from service's timeout profile
 		dialTimeout := getWSDialTimeout(p.config.GetServiceTimeoutProfile(serviceID))
 
+		// A simulated connection publishes nothing: passing a nil publisher
+		// means emitRelay's Accounting skip does not depend on the bridge
+		// remembering `simulated` correctly in a second place. simVerifier/
+		// simKeyID are only meaningful (and only read) when simulated is true.
+		bridgePublisher := p.publisher
+		var bridgeSimVerifier *SimulationVerifier
+		bridgeSimKeyID := ""
+		if simulated {
+			bridgePublisher = nil
+			bridgeSimVerifier = p.simVerifier
+			bridgeSimKeyID = simDirective.KeyID
+		}
+
 		// Create and run bridge
 		// Session end height will be set when the first relay request arrives
 		// Note: supplierAddress may be empty for PATH v1 - bridge will extract from first RelayRequest
@@ -1039,13 +1141,16 @@ func (p *ProxyServer) WebSocketHandler() http.HandlerFunc {
 			supplierAddress,
 			arrivalHeight,
 			p.relayProcessor,
-			p.publisher,
+			bridgePublisher,
 			p.responseSigner,
 			headers,
 			p.sessionMonitor, // Global session monitor (shared across all connections)
 			p.relayPipeline,  // Unified relay pipeline for validation/metering/signing
 			computeUnits,
 			dialTimeout, // Dial timeout from service's timeout profile
+			simulated,
+			bridgeSimVerifier,
+			bridgeSimKeyID,
 		)
 		if err != nil {
 			p.logger.Warn().Err(err).Msg("failed to create websocket bridge")
