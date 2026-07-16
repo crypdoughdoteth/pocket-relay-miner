@@ -32,11 +32,14 @@ reports
 # Log analysis (local only)
 logs-analysis/
 
-# Local-only scripts (ops, host-specific, monitoring playbooks, secrets)
+# Local-only working artifacts: ops scripts, host-specific config, secrets,
+# and every planning/spec/brainstorm document. Only user-facing docs are
+# tracked; design notes live here and never reach the repository.
 scripts/localonly/
 
-# GSD Planning
-.planning
+# Planning and design artifacts (GSD, superpowers, agent scratch)
+.planning/
+docs/superpowers/
 
 # Example signers: build output and installed dependencies. The examples are
 # source to read and copy; everything a toolchain generates from them stays out.

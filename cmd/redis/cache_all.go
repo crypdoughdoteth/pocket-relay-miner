@@ -16,7 +16,7 @@ import (
 // `redis cache --type all --invalidate --all` — hot-safe cleanup of every
 // regenerable cache key, executable while relayers and miners serve traffic.
 //
-// Safety invariants (see docs/superpowers/specs/2026-07-10-cache-cleanup-all-design.md):
+// Safety invariants:
 //  1. State keys ({base}:miner:*, {base}:smst:*, {base}:relays:*,
 //     {base}:suppliers:*, {base}:tx:*) are never touched.
 //  2. Healthy supplier entries are never deleted: the relayer returns 503 on
