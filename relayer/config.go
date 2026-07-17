@@ -79,6 +79,35 @@ func backendTypeHint(s string) string {
 	return ""
 }
 
+// validateBackendURLScheme enforces that a websocket backend URL uses a
+// WebSocket scheme. A websocket relay is dialed with gorilla, which requires
+// ws:// or wss://; an http://https:// URL (a natural mistake when copying a
+// jsonrpc backend, and what one operator actually shipped) is accepted by
+// url.Parse but rejected far downstream at connection time with the opaque
+// "malformed ws or wss URL", after the client upgrade is already accepted.
+// Catching it here names the problem at startup.
+//
+// Only websocket is checked. The HTTP-family types (jsonrpc/rest/cometbft)
+// accept http/https, and grpc intentionally allows http (h2c) as well as
+// grpc/grpcs, so constraining those here would reject valid configs.
+func validateBackendURLScheme(serviceID, rpcType, rawURL string) error {
+	if rpcType != BackendTypeWebSocket {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("service[%s].backends[%s]: invalid url %q: %w", serviceID, rpcType, rawURL, err)
+	}
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return fmt.Errorf(
+			"service[%s].backends[%s]: websocket backend url must use ws:// or wss:// (got %q in %q); "+
+				"an http/https url is dialed as WebSocket and fails at connect time",
+			serviceID, rpcType, u.Scheme, rawURL,
+		)
+	}
+	return nil
+}
+
 // RPCTypeToBackendType converts numeric RPCType codes (from Rpc-Type header) to backend type strings.
 // This maps the on-chain RPCType enum values to configuration keys.
 //
@@ -843,6 +872,9 @@ func (c *Config) validateServiceConfig(id string, svc ServiceConfig) error {
 			if _, err := url.Parse(backend.URL); err != nil {
 				return fmt.Errorf("service[%s].backends[%s].url is invalid: %w", id, rpcType, err)
 			}
+			if err := validateBackendURLScheme(id, rpcType, backend.URL); err != nil {
+				return err
+			}
 		}
 
 		// Validate multi-URL mode
@@ -1241,6 +1273,9 @@ func validateBackendEndpoints(serviceID, rpcType string, endpoints []BackendEndp
 		parsed, err := url.Parse(ep.URL)
 		if err != nil {
 			return fmt.Errorf("service[%s].backends[%s].urls[%d]: invalid URL %q: %w", serviceID, rpcType, i, ep.URL, err)
+		}
+		if err := validateBackendURLScheme(serviceID, rpcType, ep.URL); err != nil {
+			return err
 		}
 
 		// Normalize URL for duplicate detection: host + path (trim trailing slash)
