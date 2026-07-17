@@ -402,7 +402,7 @@ Closes #123
 ### Development Tools
 
 **Required:**
-- Go 1.24.3+
+- Go 1.26.4+ (matches `go.mod` and CI)
 - Docker + Docker Buildx
 - Make
 

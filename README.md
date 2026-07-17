@@ -42,7 +42,7 @@ Production-grade, horizontally scalable relay mining service for Pocket Network.
 
 ## Requirements
 
-- Go 1.24.3+
+- Go 1.26.4+ (matches `go.mod` and CI)
 - Redis 8.2+ (required for XACKDEL command)
 - Access to Pocket Network Shannon endpoints
 
@@ -134,16 +134,17 @@ pocket-relay-miner relay jsonrpc --localnet --service develop-http \
 ```
 
 Full testing guides — Tilt bring-up, PATH+`hey` load, and direct-CLI testing of
-all four transports (JSON-RPC, WebSocket, gRPC, streaming) — are in
+all five transports (JSON-RPC, WebSocket, gRPC, streaming, CometBFT) — are in
 [`docs/testing/`](docs/testing/README.md).
 
 ### Simulated Relays
 
 A simulated relay is signed with a **real ring signature** and served by the
 **real backend**, but it is verified against a ring pinned in the relayer's
-config instead of one read from chain — so it needs no staked application and no
-chain access. It is never metered and never published, so it never becomes part
-of a claim and is never paid for. Use it to exercise a live relayer end to end.
+config instead of one read from chain — so **the relayer admits it without any
+chain access**, and no application has to be staked. It is never metered and
+never published, so it never becomes part of a claim and is never paid for. Use
+it to exercise a live relayer end to end.
 
 ```bash
 pocket-relay-miner relay jsonrpc --localnet --service develop-http \
@@ -153,22 +154,6 @@ pocket-relay-miner relay jsonrpc --localnet --service develop-http \
 See [`docs/simulated-relays.md`](docs/simulated-relays.md) for configuration, the
 per-transport key IDs, and how to verify that nothing was charged.
 
-### Signing a Relay from Another Language
-
-Relays are signed with a **bLSAG ring signature**, not a plain secp256k1
-signature. [`examples/relay-signing/`](examples/relay-signing/README.md) documents
-the scheme byte-for-byte and ships working signers in **Node.js**, **Python** and
-**Rust**, plus a Go **oracle** that verifies your own implementation against the
-same `ring-go` the relayer runs.
-
-The ring is `[application, gateway]`, but it is built from **public** keys and
-signed by **one** private key — the signer's, normally the gateway's. That is
-what delegation means: a gateway signs for an application without ever holding
-its key. The keys themselves are plain secp256k1 scalars, 32 bytes of hex.
-
-Signing a real relay and a simulated one is the same act — so these examples use
-the simulated path to prove a signer works without staking anything.
-
 ### Debugging Redis State
 
 ```bash
@@ -177,6 +162,31 @@ pocket-relay-miner redis sessions --supplier <addr>  # Inspect sessions
 pocket-relay-miner redis smst --session <id>  # View SMST tree
 pocket-relay-miner redis keys --pattern "ha:*" --stats  # List all keys
 ```
+
+## Signing a Relay from Another Language
+
+The CLI above is convenient, but nothing requires it: a relay is just a signed
+request, so any language that can produce the signature can send one. This
+matters if you are building a gateway, or health-check tooling, outside Go.
+
+Relays are signed with a **bLSAG ring signature**, not a plain secp256k1
+signature — and the scheme has no specification other than the behaviour of the
+Go libraries that implement it.
+[`examples/relay-signing/`](examples/relay-signing/README.md) documents it
+byte-for-byte and ships working, verified signers in **Node.js**, **Python** and
+**Rust**, plus a Go **oracle** that checks an implementation of your own against
+the same `ring-go` the relayer runs.
+
+Two things worth knowing before you start:
+
+- **You only need one private key.** The ring is `[application, gateway]`, but it
+  is built from **public** keys and signed by a single private one — the
+  signer's, normally the gateway's. That is what delegation means: a gateway
+  signs for an application without ever holding its key. The keys themselves are
+  plain secp256k1 scalars, 32 bytes of hex — no keyring, no armor, no derivation.
+- **Signing a real relay and a simulated one is the same act.** So the examples
+  use the simulated path to prove a signer works end-to-end against a real
+  relayer, without staking anything or touching a chain.
 
 ## Development
 

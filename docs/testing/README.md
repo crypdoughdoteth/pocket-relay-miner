@@ -15,8 +15,9 @@ three ways to test, each with its own guide:
 - **"How many RPS does the whole path carry?" / lifecycle → claims → proofs** →
   [PATH_HEY.md](PATH_HEY.md).
 - **"Does protocol X actually work? Does the relayer reject bad input?"** →
-  [DIRECT_CLI.md](DIRECT_CLI.md). Use this for the four transports
-  (JSON-RPC, WebSocket, gRPC, streaming) and for anything error-related.
+  [DIRECT_CLI.md](DIRECT_CLI.md). Use this for the five transports
+  (JSON-RPC, WebSocket, gRPC, streaming, CometBFT) and for anything
+  error-related.
 
 > **Key gotcha:** PATH masks relayer `503`s as `200` + empty body. So the PATH +
 > `hey` path is throughput/lifecycle only — for error-path and negative testing,
