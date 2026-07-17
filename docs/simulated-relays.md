@@ -9,8 +9,9 @@ A simulated relay is _almost 100% a real relay_. It travels the same
 transports and is signed with a **real ring signature** (exactly like a
 PATH app/gateway relay). The only differences from a paid relay are:
 
-- it is verified against a ring **pinned in the relayer config** instead of
-  read from chain, so it needs no chain access on either side;
+- it is verified against a ring **pinned in the relayer config** instead of one
+  read from chain, so **the relayer needs no chain access to admit it**, and no
+  application has to be staked;
 - it is **never metered** against the application's stake allowance and
   **never published** to the WAL, so it never becomes part of a claim — and a
   relay that is never claimed is never settled and never paid for;
@@ -141,9 +142,18 @@ secret (it travels in plaintext); the ring signature is the actual gate.
 
 ### Firing a simulated relay with the CLI
 
-The `relay` CLI builds a locally-ringed simulated request (no chain queries)
-and sends it directly to the relayer. Supply the simulation flags plus a
-supplier that is loaded on the relayer:
+The `relay` CLI **builds** a locally-ringed simulated request — the ring comes
+from the pinned public keys, so **signing** needs no chain query and no staked
+application.
+
+The CLI itself still connects to a node, and it is worth being precise about
+why: after the relay returns, it verifies the **supplier's signature** on the
+response, which means resolving that supplier's public key from chain. Signing a
+simulated relay needs no chain; checking the answer does. The CLI always
+verifies and offers no flag to skip it — a forged response is exactly what you
+want a health check to catch.
+
+Supply the simulation flags plus a supplier that is loaded on the relayer:
 
 ```bash
 pocket-relay-miner relay jsonrpc \
@@ -157,6 +167,15 @@ Works across all five modes: `jsonrpc`, `rest`/`stream`, `cometbft`, `grpc`,
 `websocket`. The app and gateway public keys used to build the ring are derived
 from the app/gateway keys the CLI already resolves (the same keys whose public
 halves you pinned in the relayer config).
+
+**Firing one from your own tooling, in another language:** the CLI is convenient
+but not required — a simulated relay is an ordinary signed relay, so anything
+that can produce the ring signature can send one.
+[`examples/relay-signing/`](../examples/relay-signing/README.md) documents the
+signature byte-for-byte and ships working signers in **Node.js**, **Python** and
+**Rust**, plus an oracle to verify an implementation of your own. Note that you
+need only **one** private key — the signer's, normally the gateway's — plus the
+public keys of the ring.
 
 A successful simulated relay returns a **supplier-signed** response containing
 the real backend result — the same response shape a paying gateway would
@@ -191,24 +210,152 @@ pocket-relay-miner relay websocket --localnet --service develop-websocket --supp
 pocket-relay-miner relay stream    --localnet --service develop-stream    --supplier $SUP --simulate --sim-key-id sim-stream --batches 3
 ```
 
-### Verifying it is never mined
+### Verifying it yourself
 
-A simulated relay must produce **no** mining state — that is what guarantees it
-is never claimed, and therefore never settled or paid for. To confirm, fire a
-burst of simulated relays and check that no claim/session/WAL state was created
-— only the simulated metric moves:
+Do not take the claims above on trust — they are checkable in a few minutes, and
+you should check them on your own deployment before wiring simulated relays into
+anything. The walk-through below is the one used to validate the feature; every
+command and every expected result is real output from a localnet run.
+
+> **Localnet setup gotcha.** `tilt_config.yaml` is user-local and gitignored, and
+> it **wins** over the config Tilt generates. The localnet simulation identities
+> are injected on the *generation* path, so a `tilt_config.yaml` created before
+> simulation existed has no `simulation:` block and every command below will fail
+> with a confusing `403`. If that happens, delete the file and let Tilt rebuild
+> it: `rm tilt_config.yaml && tilt up`. Confirm with
+> `grep -A2 'simulation:' tilt_config.yaml`.
+
+#### 1. Baseline: is the relayer serving real relays?
+
+Establish this first, or a later rejection will look like simulation's fault
+when it is not.
 
 ```bash
-# Fire a burst of simulated relays (above), then inspect Redis:
-redis-cli --scan --pattern 'ha:miner:sessions:*' | wc -l   # unchanged by simulation
-redis-cli --scan --pattern 'ha:smst:*'           | wc -l   # unchanged by simulation
-redis-cli --scan --pattern '*simv1*'             | wc -l   # 0 — a synthetic sim session never persists
-redis-cli XLEN ha:relays:<supplier>                        # WAL not grown by simulation
+SUP=pokt19a3t4yunp0dlpfjrp7qwnzwlrzd5fzs2gjaaaj
+pocket-relay-miner relay jsonrpc --localnet --service develop-http --supplier $SUP
 ```
 
-A claim is built from an SMST tree; a simulated relay creates no SMST tree, so
-it is **structurally impossible** for simulated traffic to produce a claim or a
-proof — not merely suppressed.
+Expect `SUCCESS`, `Signature: VALID`, and a real backend result.
+
+#### 2. The happy paths
+
+Run the five commands from the previous section. Each should return `SUCCESS`,
+`Signature: VALID`, and a **real** backend response — a simulated relay hits your
+real backend; only the accounting is skipped.
+
+A detail worth noticing in the output: the simulated relay's **`Build Time` is
+~1 ms against ~34 ms for the real one**. Those ~33 ms are the chain query the
+simulated path does not make, because its ring comes from your config.
+
+#### 3. The unhappy paths — these must be rejected
+
+A feature that only works is half-tested. All three of these are decided by the
+relayer against its own state; the caller is never trusted.
+
+```bash
+# Unknown key_id: no such identity is pinned
+pocket-relay-miner relay jsonrpc --localnet --service develop-http --supplier $SUP \
+  --simulate --sim-key-id does-not-exist
+# -> 403 simulation rejected: simulation: unknown key_id
+
+# Identity/service mismatch: sim-http's identity aimed at a different service
+pocket-relay-miner relay cometbft --localnet --service develop-cometbft --supplier $SUP \
+  --simulate --sim-key-id sim-http
+# -> 403 simulation rejected: simulation: request application address does not
+#    match pinned identity
+
+# Forgery: a cryptographically VALID signature over a ring you have not pinned
+pocket-relay-miner relay jsonrpc --localnet --service develop-http --supplier $SUP \
+  --simulate --sim-key-id sim-http \
+  --gateway-priv-key 1a11ef074d9b51e46886dc9a1df11e7b986611d0f336bdcf1f0adce3e037ab11 \
+  --sim-gateway-pubkeys 02bbbf99abdcddac27350bca272d7146187c091aacfc1c6f90819c9b6daf4fe846
+# -> 403 simulation rejected: simulation: ring signature verification failed:
+#    ring not in pinned set
+```
+
+The forgery case needs **both** flags. Overriding only `--sim-gateway-pubkeys`
+makes the CLI sign with its real gateway key over a ring that key is not a member
+of, so signing fails locally (`failed to find given key in public key set`) and
+the request never reaches the relayer — that tests the client, not the defence.
+Passing the matching private key produces a genuine signature over a genuine
+ring, which is precisely what the relayer must refuse.
+
+#### 4. Prove nothing was charged
+
+This is the claim that matters. Snapshot the mining state, fire a burst, and
+compare.
+
+```bash
+# BEFORE
+redis-cli --scan --pattern 'ha:relays:*'         | wc -l
+redis-cli --scan --pattern 'ha:smst:*'           | wc -l
+redis-cli --scan --pattern 'ha:miner:sessions:*' | wc -l
+
+# 25 simulated relays
+for i in $(seq 1 25); do
+  pocket-relay-miner relay jsonrpc --localnet --service develop-http --supplier $SUP \
+    --simulate --sim-key-id sim-http >/dev/null 2>&1 && echo -n "." || echo -n "x"
+done; echo
+
+# AFTER — the first three must be IDENTICAL
+redis-cli --scan --pattern 'ha:relays:*'         | wc -l
+redis-cli --scan --pattern 'ha:smst:*'           | wc -l
+redis-cli --scan --pattern 'ha:miner:sessions:*' | wc -l
+redis-cli --scan --pattern '*simv1*'             | wc -l   # must be 0
+redis-cli --scan --pattern 'ha:sim:replay:*'     | wc -l   # will be 25 — see below
+```
+
+A real run: `ha:relays` 15 → **15**, `ha:smst` 0 → **0**, `ha:miner:sessions`
+4 → **4**, `*simv1*` = **0**, after 25 simulated relays.
+
+**`ha:sim:replay:*` growing is correct, not a leak.** It is the replay-dedup set
+— one entry per simulated signature, shared across the fleet so a captured
+request cannot be replayed once to each replica. It expires on its own (TTL =
+2× the freshness window) and is not mining state: no WAL, no tree, no claim.
+
+#### 5. Confirm the metric isolation
+
+```bash
+# On localnet the relayer serves its own metrics on :9190 (9091 is Prometheus).
+curl -s localhost:9190/metrics | grep -E '^ha_relayer_(relays_received_total|simulated_relays_total)'
+```
+
+A real run, after 27 simulated and 2 real relays:
+
+```
+ha_relayer_relays_received_total{rpc_type="jsonrpc",service_id="develop-http"} 2
+ha_relayer_simulated_relays_total{result="success",service="develop-http",...} 27
+```
+
+The simulated traffic never touched the counter that measures real load. With
+more than one replica, aggregate across them instead:
+
+```bash
+curl -sG localhost:9091/api/v1/query \
+  --data-urlencode 'query=sum(ha_relayer_simulated_relays_total) by (result)'
+```
+
+#### 6. Prove the check above is not blind
+
+The most important step, and the easiest to skip. "Nothing changed" is worthless
+unless the same counters *do* change when a relay is genuinely mined:
+
+```bash
+pocket-relay-miner relay jsonrpc --localnet --service develop-http --supplier $SUP
+sleep 2
+redis-cli --scan --pattern 'ha:smst:*'           | wc -l
+redis-cli --scan --pattern 'ha:miner:sessions:*' | wc -l
+```
+
+A real run: `ha:smst` 0 → **2** and `ha:miner:sessions` 4 → **6**. One real relay
+moves them; 25 simulated ones did not.
+
+#### Why it is impossible, not merely suppressed
+
+A claim is built from an SMST tree. A simulated relay is never published to the
+WAL, so no tree is ever built, so there is nothing for a claim to be made from.
+The absence of mining state is not a rule the code remembers to follow — there
+is no code path from a simulated relay to a claim.
 
 ### Metrics
 
@@ -220,13 +367,22 @@ counters:
   `replay_rejected`, `identity_mismatch`, `service_unknown`,
   `service_not_allowed`, `supplier_not_loaded`, `sign_failed`, `backend_error`,
   `meter_degraded`, `dedup_unavailable`). `key_id` is deliberately **not** a
-  label.
+  label: it would be caller-controlled and unbounded, and a metric label is a
+  bad place to learn that.
 - `ha_relayer_simulated_relay_duration_seconds{transport, service}` —
   end-to-end latency of simulated relays.
 
+**`verify_failed` is the catch-all**, and it is wider than its name suggests. It
+covers an unknown or disabled `key_id`, an expired identity, a stale timestamp,
+a malformed session id, **and** a bad signature. So a spike in `verify_failed`
+is not necessarily someone forging signatures — the far likelier causes are a
+`key_id` you removed, an identity that hit its `not_after`, or clock skew
+between your health checker and the relayer. The other results are specific;
+this one needs the relayer's logs to narrow down.
+
 To confirm isolation, watch that a burst of simulated relays moves
-`ha_relayer_simulated_relays_total` while `ha_relayer_relays_served_total` and
-the other real counters stay flat.
+`ha_relayer_simulated_relays_total` while `ha_relayer_relays_received_total`,
+`ha_relayer_relays_served_total` and the other real counters stay flat.
 
 ### Rotation and revocation
 
