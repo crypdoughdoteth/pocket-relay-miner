@@ -41,6 +41,44 @@ const (
 // DefaultBackendType is the default backend type when not configured.
 const DefaultBackendType = BackendTypeJSONRPC
 
+// isKnownBackendType reports whether s is one of the five backend/transport
+// type names that a relay can be routed to. The backend map key must be one of
+// these exactly; there are no aliases (see the config validation).
+func isKnownBackendType(s string) bool {
+	switch s {
+	case BackendTypeJSONRPC, BackendTypeREST, BackendTypeWebSocket, BackendTypeGRPC, BackendTypeCometBFT:
+		return true
+	default:
+		return false
+	}
+}
+
+// backendTypeHint returns a " (did you mean \"websocket\"?)" style suffix for a
+// common misspelling of a backend type, or "" when there is no obvious match.
+// It exists because the abbreviation `ws` for `websocket` is the exact mistake
+// an AI agent produced from a schema that did not constrain the key.
+func backendTypeHint(s string) string {
+	hints := map[string]string{
+		"ws":         BackendTypeWebSocket,
+		"websockets": BackendTypeWebSocket,
+		"wss":        BackendTypeWebSocket,
+		"http":       BackendTypeJSONRPC,
+		"json":       BackendTypeJSONRPC,
+		"json-rpc":   BackendTypeJSONRPC,
+		"json_rpc":   BackendTypeJSONRPC,
+		"rpc":        BackendTypeJSONRPC,
+		"grpcs":      BackendTypeGRPC,
+		"comet":      BackendTypeCometBFT,
+		"comet_bft":  BackendTypeCometBFT,
+		"tendermint": BackendTypeCometBFT,
+		"restful":    BackendTypeREST,
+	}
+	if want, ok := hints[s]; ok {
+		return fmt.Sprintf(" (did you mean %q?)", want)
+	}
+	return ""
+}
+
 // RPCTypeToBackendType converts numeric RPCType codes (from Rpc-Type header) to backend type strings.
 // This maps the on-chain RPCType enum values to configuration keys.
 //
@@ -772,6 +810,21 @@ func (c *Config) validateServiceConfig(id string, svc ServiceConfig) error {
 
 	// Validate each backend
 	for rpcType, backend := range svc.Backends {
+		// The backend map key IS the transport type, and it must be one of the
+		// known types — relays are routed to a backend by exact type match with
+		// no fallback, so a key like `ws` (a common abbreviation of `websocket`)
+		// configures a backend nothing will ever route to, and the relay is
+		// rejected at request time with a cryptic transport error. Reject it
+		// here, at load, naming the valid keys.
+		if !isKnownBackendType(rpcType) {
+			return fmt.Errorf(
+				"service[%s].backends[%s]: unknown backend type %q (valid: %s, %s, %s, %s, %s)%s",
+				id, rpcType, rpcType,
+				BackendTypeJSONRPC, BackendTypeREST, BackendTypeWebSocket, BackendTypeGRPC, BackendTypeCometBFT,
+				backendTypeHint(rpcType),
+			)
+		}
+
 		hasURL := backend.URL != ""
 		hasURLs := len(backend.URLs) > 0
 
@@ -1036,40 +1089,20 @@ func (c *Config) ValidateTimeoutProfiles() error {
 	return nil
 }
 
-// GetBackendConfig returns the BackendConfig for a service and RPC type,
-// using the same fallback chain as GetPool (exact -> default_backend -> jsonrpc -> rest -> any).
-// Returns nil if no backend config is found after all fallbacks.
-// Use this to access pool-level shared config (headers, auth) alongside GetPool().
+// GetBackendConfig returns the BackendConfig for a service and a concrete
+// backend/transport type, by EXACT match only — the same strict contract as
+// GetPool, and paired with it (this supplies the headers/auth/base_path for the
+// pool GetPool returns, so the two must resolve to the SAME backend). The old
+// "any available" tier here was especially unsafe: it returned a backend chosen
+// by non-deterministic map iteration, so a request could get different config
+// on different calls. See GetPool for why cross-transport fallback is wrong.
 func (c *Config) GetBackendConfig(serviceID, rpcType string) *BackendConfig {
 	svc, svcExists := c.Services[serviceID]
 	if !svcExists {
 		return nil
 	}
 
-	// Direct lookup
 	if backend, ok := svc.Backends[rpcType]; ok {
-		return &backend
-	}
-
-	// Fallback: default_backend
-	if svc.DefaultBackend != "" {
-		if backend, ok := svc.Backends[svc.DefaultBackend]; ok {
-			return &backend
-		}
-	}
-
-	// Fallback: jsonrpc
-	if backend, ok := svc.Backends[BackendTypeJSONRPC]; ok {
-		return &backend
-	}
-
-	// Fallback: rest
-	if backend, ok := svc.Backends[BackendTypeREST]; ok {
-		return &backend
-	}
-
-	// Fallback: any available
-	for _, backend := range svc.Backends {
 		return &backend
 	}
 
@@ -1134,49 +1167,40 @@ func (c *Config) BuildPools() error {
 	return nil
 }
 
-// GetPool returns the pool for a service and RPC type, with fallback chain.
-// Fallback order: exact match -> default_backend -> jsonrpc -> rest -> any available.
-// Returns nil if no pool is found after all fallbacks.
+// GetPool returns the pool for a service and a concrete backend/transport type,
+// by EXACT match only. There is deliberately no cross-transport fallback.
+//
+// A relay's transport is a wire protocol, not a preference: a WebSocket relay
+// needs a ws:// backend and a persistent connection, a gRPC relay needs HTTP/2
+// framing, and neither can be served by the http:// backend a jsonrpc/rest pool
+// holds. The former fallback chain (default_backend -> jsonrpc -> rest -> any)
+// silently handed those requests an incompatible backend, which then failed
+// deep in the transport with a cryptic error (e.g. gorilla's "malformed ws or
+// wss URL") long after the point where the misconfiguration could be named. A
+// missing backend for a requested type is a configuration error; surfacing it
+// as nil here lets the caller reject cleanly.
+//
+// The one legitimate default — "no Rpc-Type header, use the service's
+// default_backend" — is resolved by the caller BEFORE this is called (see the
+// proxy's header handling), so by the time a type reaches GetPool it is always
+// concrete and must match exactly.
+//
+// A miss on a service that exists is recorded so operators can see relays being
+// rejected for a transport they never configured a backend for.
 func (c *Config) GetPool(serviceID, rpcType string) *pool.Pool {
 	if c.pools == nil {
 		return nil
 	}
 
-	// Direct lookup
-	key := serviceID + ":" + rpcType
-	if p, ok := c.pools[key]; ok {
+	if p, ok := c.pools[serviceID+":"+rpcType]; ok {
 		return p
 	}
 
-	// Fallback: default_backend
-	svc, svcExists := c.Services[serviceID]
-	if !svcExists {
-		return nil
+	// Only count a miss when the service itself exists; an unknown service is a
+	// routing miss, not a backend-transport misconfiguration.
+	if _, svcExists := c.Services[serviceID]; svcExists {
+		backendMissing.WithLabelValues(serviceID, rpcType).Inc()
 	}
-
-	if svc.DefaultBackend != "" {
-		if p, ok := c.pools[serviceID+":"+svc.DefaultBackend]; ok {
-			return p
-		}
-	}
-
-	// Fallback: jsonrpc
-	if p, ok := c.pools[serviceID+":"+BackendTypeJSONRPC]; ok {
-		return p
-	}
-
-	// Fallback: rest
-	if p, ok := c.pools[serviceID+":"+BackendTypeREST]; ok {
-		return p
-	}
-
-	// Fallback: any available
-	for backendType := range svc.Backends {
-		if p, ok := c.pools[serviceID+":"+backendType]; ok {
-			return p
-		}
-	}
-
 	return nil
 }
 

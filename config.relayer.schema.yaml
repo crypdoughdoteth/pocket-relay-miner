@@ -189,8 +189,20 @@ properties:
           default: jsonrpc
         backends:
           type: object
-          description: Backend configurations per RPC type
+          description: >-
+            Backend configurations, keyed by transport type. The key MUST be one
+            of the five transport types below -- a relay is routed to a backend
+            by exact type match with no fallback, so any other key (e.g. "ws"
+            instead of "websocket") configures a backend nothing will route to,
+            and its relays are rejected at request time.
           minProperties: 1
+          propertyNames:
+            enum:
+              - jsonrpc
+              - rest
+              - websocket
+              - grpc
+              - cometbft
           additionalProperties:
             type: object
             description: Configuration for a specific RPC type backend. Use either url (single backend) or urls (multi-backend pool) -- they are mutually exclusive.
@@ -223,10 +235,14 @@ properties:
               load_balancing:
                 type: string
                 enum:
+                  - first_healthy
                   - round_robin
-                  - least_conn
-                  - app_hash
-                description: Load balancing strategy for this backend pool. Phase 1 uses first_healthy (default), round_robin added in Phase 2, others in Phase 10.
+                description: >-
+                  Load balancing strategy for this backend pool. "first_healthy"
+                  (the default) always routes to the first healthy endpoint;
+                  "round_robin" distributes across healthy endpoints. These are
+                  the only values the relayer accepts.
+                default: first_healthy
               headers:
                 type: object
                 description: Additional headers for backend requests

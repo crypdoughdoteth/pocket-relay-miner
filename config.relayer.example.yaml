@@ -85,10 +85,16 @@ services:
     max_body_size_bytes: 10485760  # 10MB
     default_backend: jsonrpc  # Use jsonrpc for proper protocol labeling
     backends:
-      # Multi-backend pool with load balancing (primary format)
-      # Each backend gets health-checked independently (Phase 4)
+      # Backends are keyed by TRANSPORT TYPE. The key must be exactly one of:
+      #   jsonrpc | rest | websocket | grpc | cometbft
+      # A relay is routed to a backend by exact type match, with NO fallback to
+      # another type -- a websocket relay needs a `websocket:` backend with a
+      # ws:// url, a grpc relay needs a `grpc:` backend, and so on. An unknown
+      # key (e.g. `ws:` instead of `websocket:`) is rejected at startup.
+      #
+      # Each backend is health-checked independently.
       jsonrpc:
-        load_balancing: round_robin  # Options: round_robin (Phase 2), least_conn, app_hash (Phase 10)
+        load_balancing: round_robin  # first_healthy (default) or round_robin
         urls:
           - "http://backend:8545"
           - name: backup

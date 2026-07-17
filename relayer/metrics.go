@@ -33,6 +33,23 @@ var (
 		[]string{"service_id", "rpc_type", "status_code"},
 	)
 
+	// backendMissing counts relays that resolved no backend pool for their
+	// requested transport type on a service that exists. Under the strict
+	// backend contract (no cross-transport fallback) this is the signal an
+	// operator needs: e.g. a `websocket` relay arriving at a service that has
+	// only a jsonrpc backend configured. rpc_type is the resolved backend-type
+	// name, bounded to the five known transports (plus any explicit override),
+	// so cardinality stays low.
+	backendMissing = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "backend_missing_total",
+			Help:      "Relays with no backend configured for their transport type (service exists but lacks that backend)",
+		},
+		[]string{"service_id", "rpc_type"},
+	)
+
 	relaysRejected = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
