@@ -121,7 +121,7 @@ gateway acts for the app, and never holds the app's key.
 
 There is no specification document for this scheme. It is defined by what
 [`pokt-network/ring-go`](https://github.com/pokt-network/ring-go) v0.2.0 and
-`pokt-network/go-dleq` do. This README is a description of that behaviour,
+`pokt-network/go-dleq` do. This README is a description of that behavior,
 verified against their source and against a running verifier — not a standard
 you can look up elsewhere.
 
@@ -237,12 +237,12 @@ It ships two secp256k1 backends and they disagree:
 | `curve_decred.go` | `!ethereum_secp256k1` — **the default, what you run** | left-aligns (the quirk) |
 | `curve_ethereum.go` | `cgo && ethereum_secp256k1` | canonical, **no quirk** |
 
-Land in the wrong file and you will "prove" the quirk does not exist. It is a
+Land in the wrong file, and you will "prove" the quirk does not exist. It is a
 coin flip which one you open. The two backends are therefore **wire-incompatible
 for ~1 challenge in 256**, which would make `-tags ethereum_secp256k1` a silent
 consensus fork. This repository refuses to build with it
 ([`rings/ethereum_backend_unsupported.go`](../../rings/ethereum_backend_unsupported.go));
-the scheme is defined by the default backend's behaviour, quirk and all.
+the scheme is defined by the default backend's behavior, quirk and all.
 
 Two further consequences of how Go writes it, both easy to get subtly wrong:
 
